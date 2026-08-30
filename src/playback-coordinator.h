@@ -34,5 +34,6 @@ bool mps_coordinator_take_request(struct mps_playback_coordinator *coordinator, 
 bool mps_coordinator_matches(const struct mps_playback_coordinator *coordinator, uint64_t generation);
 void mps_coordinator_cancel(struct mps_playback_coordinator *coordinator);
 bool mps_coordinator_cancel_for_restart(struct mps_playback_coordinator *coordinator, bool active_source_present);
+bool mps_source_is_active_child(bool active_slot, bool child_added);
 enum mps_switch_failure mps_coordinator_fail(struct mps_playback_coordinator *coordinator, uint64_t generation);
 bool mps_coordinator_complete(struct mps_playback_coordinator *coordinator, uint64_t generation);

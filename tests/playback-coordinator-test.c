@@ -147,6 +147,14 @@ static void test_restart_preserves_bootstrap_without_active_source(void)
 	CHECK(!coordinator.request_pending);
 }
 
+static void test_active_child_enumeration_policy(void)
+{
+	CHECK(mps_source_is_active_child(true, false));
+	CHECK(mps_source_is_active_child(true, true));
+	CHECK(mps_source_is_active_child(false, true));
+	CHECK(!mps_source_is_active_child(false, false));
+}
+
 int main(void)
 {
 	test_latest_rapid_request_wins();
@@ -157,6 +165,7 @@ int main(void)
 	test_retry_request_preserves_failure_count();
 	test_cancel_invalidates_in_flight_generation();
 	test_restart_preserves_bootstrap_without_active_source();
+	test_active_child_enumeration_policy();
 	puts("playback coordinator tests passed");
 	return 0;
 }

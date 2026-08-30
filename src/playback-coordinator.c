@@ -56,6 +56,11 @@ bool mps_coordinator_cancel_for_restart(struct mps_playback_coordinator *coordin
 	return true;
 }
 
+bool mps_source_is_active_child(bool active_slot, bool child_added)
+{
+	return active_slot || child_added;
+}
+
 enum mps_switch_failure mps_coordinator_fail(struct mps_playback_coordinator *coordinator, uint64_t generation)
 {
 	if (!mps_coordinator_matches(coordinator, generation))

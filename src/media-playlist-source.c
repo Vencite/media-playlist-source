@@ -2027,10 +2027,39 @@ static void mps_video_tick(void *data, float seconds)
 static void mps_enum_sources(void *data, obs_source_enum_proc_t cb, void *param)
 {
 	struct media_playlist_source *mps = data;
-	obs_source_t *source = get_active_source_ref(mps);
-	if (source) {
-		cb(mps->source, source, param);
-		obs_source_release(source);
+	obs_source_t *sources[2] = {0};
+	size_t source_count = 0;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	for (size_t i = 0; i < 2; i++) {
+		struct media_source_slot *slot = &mps->media_slots[i];
+		bool active_slot = slot == mps->active_slot;
+		bool standby_slot = slot == mps->standby_slot;
+		bool duplicate = false;
+		obs_source_t *source;
+
+		if ((!active_slot && !standby_slot) || !slot->source ||
+		    !mps_source_is_active_child(active_slot, slot->child_added))
+			continue;
+
+		for (size_t j = 0; j < source_count; j++) {
+			if (sources[j] == slot->source) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+
+		source = obs_source_get_ref(slot->source);
+		if (source)
+			sources[source_count++] = source;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	for (size_t i = 0; i < source_count; i++) {
+		cb(mps->source, sources[i], param);
+		obs_source_release(sources[i]);
 	}
 }
 

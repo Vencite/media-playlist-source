@@ -26,10 +26,11 @@ Use a saved local-video playlist with at least `A` and `B`:
 
 1. Start OBS while the playlist scene is current. The first file must start without pressing **Next**.
 2. Start OBS on another scene, then switch to the playlist scene. The first file must start without pressing **Next**.
-3. After playback is initialized, leave the playlist scene and return. Existing playback behavior must be preserved.
+3. After playback is initialized, leave the playlist scene while `A` is active and `B` is pending, then return. Existing playback behavior must be preserved.
 4. With `A` active, request **Next** to `B`, then use **Restart Current** before `B` is activated. `B` must be cancelled; `A` remains current and restarts.
-5. Check **Stop/Restart**, **Pause/Unpause**, **Always Play**, and **Stop/Play Next** independently during activation and scene visibility changes. None may create duplicate audio or duplicate decoders.
-6. Let `A` end naturally. The normal `A -> B` transition must remain seamless.
+5. Verify that a prefetched standby `B` with `child_added == false` does not activate or play while hidden.
+6. Check **Stop/Restart**, **Pause/Unpause**, **Always Play**, and **Stop/Play Next** independently during activation and scene visibility changes. There must be no duplicate enumeration, audio, or decoders.
+7. Let `A` end naturally. The normal `A -> B` transition must remain seamless.
 
 ## Local-video decoder start lifecycle
 
