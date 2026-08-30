@@ -26,6 +26,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/deque.h>
 #include <plugin-support.h>
 #include "playlist.h"
+#include "playback-coordinator.h"
 #include "shuffler.h"
 
 /* clang-format off */
@@ -44,15 +45,54 @@ enum restart_behavior {
 
 /* clang-format on */
 
+struct media_playlist_source;
+struct media_source_callback_context;
+
+struct media_source_slot {
+	struct media_playlist_source *owner;
+	struct media_source_callback_context *callback_context;
+	obs_source_t *source;
+	char *path;
+	char *media_id;
+	char *folder_item_filename;
+	uint64_t source_generation;
+	uint64_t request_generation;
+	size_t media_index;
+	size_t folder_item_index;
+	bool folder_item;
+	bool is_url;
+	bool local_video;
+	bool child_added;
+	bool manual_showing;
+	bool start_requested;
+	bool started;
+	bool failed;
+	bool ended;
+	bool ended_handled;
+	bool expected_stop;
+	bool produced_output;
+	bool audio_enabled;
+};
+
 struct media_playlist_source {
 	obs_source_t *source;
-	obs_source_t *current_media_source;
+	struct media_source_slot media_slots[2];
+	struct media_source_slot *active_slot;
+	struct media_source_slot *standby_slot;
+	uint64_t next_source_generation;
+	struct mps_playback_coordinator coordinator;
+	bool automatic_next_pending;
+	bool retrying_switch;
+	bool prefetch_dirty;
+	bool destroying;
+	bool resetting;
+	size_t consecutive_failures;
+	pthread_mutex_t lifecycle_mutex;
 
 	struct shuffler shuffler;
 	bool shuffle;
 	bool loop;
 	bool paused;
-	bool user_stopped;
 	bool use_hw_decoding;
 	bool close_when_inactive;
 	pthread_mutex_t mutex;
@@ -97,6 +137,7 @@ static bool valid_extension(const char *ext);
 
 static void clear_media_source(void *data);
 static void update_media_source(void *data, bool forced);
+static obs_source_t *get_active_source_ref(struct media_playlist_source *mps);
 
 static void select_index_proc_(struct media_playlist_source *mps, size_t media_index, size_t folder_item_index);
 
@@ -112,6 +153,7 @@ static enum obs_media_state mps_get_state(void *data);
 static void mps_end_reached(void *data);
 
 static void media_source_ended(void *data, calldata_t *cd);
+static void media_source_started(void *data, calldata_t *cd);
 void mps_audio_callback(void *data, obs_source_t *source, const struct audio_data *audio_data, bool muted);
 static bool play_selected_clicked(obs_properties_t *props, obs_property_t *property, void *data);
 

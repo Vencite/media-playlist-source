@@ -40,6 +40,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_FFMPEG_HW_DECODE "hw_decode"
 #define S_FFMPEG_CLOSE_WHEN_INACTIVE "close_when_inactive"
 #define S_FFMPEG_RESTART_ON_ACTIVATE "restart_on_activate"
+#define S_FFMPEG_CLEAR_ON_MEDIA_END "clear_on_media_end"
+#define S_FFMPEG_IS_STINGER "is_stinger"
 
 #define T_(text) obs_module_text(text)
 #define T_PLAYLIST T_("Playlist")
@@ -68,6 +70,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_STOP T_("Stop")
 #define T_PLAYLIST_NEXT T_("Next")
 #define T_PLAYLIST_PREV T_("Previous")
+
+static bool playlist_has_next(struct media_playlist_source *mps);
+static bool playlist_has_previous(struct media_playlist_source *mps);
+
+struct media_source_callback_context {
+	struct media_source_slot *slot;
+	uint64_t source_generation;
+	bool ended_before_publish;
+};
 
 static inline void set_current_media_index(struct media_playlist_source *mps, size_t index)
 {
@@ -160,6 +171,396 @@ static bool valid_extension(const char *ext)
 	return valid;
 }
 
+static bool is_local_video(const struct media_file_data *media)
+{
+	const char *extension;
+	struct dstr haystack = {0};
+	struct dstr needle = {0};
+	bool is_video;
+
+	if (!media || media->is_url)
+		return false;
+
+	extension = os_get_path_extension(media->path);
+	if (!extension || !*extension)
+		return false;
+
+	dstr_cat_ch(&needle, '*');
+	dstr_cat(&needle, extension);
+	dstr_copy(&haystack, video_filter);
+	is_video = dstr_find_i(&haystack, needle.array);
+	dstr_free(&haystack);
+	dstr_free(&needle);
+	return is_video;
+}
+
+static void clear_audio_queues_locked(struct media_playlist_source *mps)
+{
+	for (size_t i = 0; i < MAX_AUDIO_CHANNELS; i++)
+		deque_free(&mps->audio_data[i]);
+	deque_free(&mps->audio_frames);
+	deque_free(&mps->audio_timestamps);
+}
+
+static void mute_active_audio(struct media_playlist_source *mps)
+{
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	pthread_mutex_lock(&mps->audio_mutex);
+	if (mps->active_slot)
+		mps->active_slot->audio_enabled = false;
+	clear_audio_queues_locked(mps);
+	pthread_mutex_unlock(&mps->audio_mutex);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+}
+
+static obs_source_t *detach_active_source(struct media_playlist_source *mps)
+{
+	obs_source_t *source = NULL;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	pthread_mutex_lock(&mps->audio_mutex);
+	if (mps->active_slot && mps->active_slot->source) {
+		source = obs_source_get_ref(mps->active_slot->source);
+		mps->active_slot->expected_stop = true;
+		mps->active_slot->audio_enabled = false;
+		mps->active_slot = NULL;
+	}
+	clear_audio_queues_locked(mps);
+	pthread_mutex_unlock(&mps->audio_mutex);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	return source;
+}
+
+static obs_source_t *get_active_source_ref(struct media_playlist_source *mps)
+{
+	obs_source_t *source = NULL;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (mps->active_slot && mps->active_slot->source)
+		source = obs_source_get_ref(mps->active_slot->source);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	return source;
+}
+
+static obs_source_t *get_slot_source_ref(struct media_playlist_source *mps, struct media_source_slot *slot)
+{
+	obs_source_t *source = NULL;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (slot && slot->source)
+		source = obs_source_get_ref(slot->source);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	return source;
+}
+
+static void destroy_media_slot(struct media_source_slot *slot)
+{
+	struct media_playlist_source *mps = slot->owner;
+	struct media_source_callback_context *callback_context;
+	obs_source_t *source;
+	char *path;
+	char *media_id;
+	char *folder_item_filename;
+	bool child_added;
+	bool manual_showing;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	source = slot->source;
+	callback_context = slot->callback_context;
+	path = slot->path;
+	media_id = slot->media_id;
+	folder_item_filename = slot->folder_item_filename;
+	child_added = slot->child_added;
+	manual_showing = slot->manual_showing;
+	slot->source = NULL;
+	slot->callback_context = NULL;
+	slot->path = NULL;
+	slot->media_id = NULL;
+	slot->folder_item_filename = NULL;
+	slot->request_generation = 0;
+	slot->failed = false;
+	slot->ended = false;
+	slot->ended_handled = false;
+	slot->expected_stop = true;
+	slot->produced_output = false;
+	slot->audio_enabled = false;
+	slot->is_url = false;
+	slot->child_added = false;
+	slot->manual_showing = false;
+	slot->start_requested = false;
+	slot->started = false;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	if (source) {
+		obs_source_remove_audio_capture_callback(source, mps_audio_callback, callback_context);
+		signal_handler_disconnect(obs_source_get_signal_handler(source), "media_ended", media_source_ended,
+					  callback_context);
+		signal_handler_disconnect(obs_source_get_signal_handler(source), "media_started", media_source_started,
+					  callback_context);
+		if (manual_showing)
+			obs_source_dec_showing(source);
+		if (child_added)
+			obs_source_remove_active_child(mps->source, source);
+		obs_source_release(source);
+	}
+	bfree(callback_context);
+
+	bfree(path);
+	bfree(media_id);
+	bfree(folder_item_filename);
+}
+
+static bool cancel_pending_transition(struct media_playlist_source *mps, bool discard_prefetch,
+				      bool require_active_source)
+{
+	struct media_source_slot *standby = NULL;
+	bool pending;
+	bool request_pending;
+	bool active_source_present = false;
+	uint64_t pending_generation = 0;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	request_pending = mps->coordinator.request_pending;
+	if (require_active_source) {
+		active_source_present = mps->active_slot && mps->active_slot->source;
+		pending_generation = mps->coordinator.generation;
+		pending = mps_coordinator_cancel_for_restart(&mps->coordinator, active_source_present);
+	} else {
+		pending = request_pending;
+		if (pending)
+			mps_coordinator_cancel(&mps->coordinator);
+	}
+	if (pending || discard_prefetch)
+		standby = mps->standby_slot;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (standby)
+		destroy_media_slot(standby);
+	if (require_active_source && request_pending) {
+		obs_log(LOG_DEBUG, "Restart Current: pending transition generation %llu %s; active source=%s%s",
+			(unsigned long long)pending_generation, pending ? "cancelled" : "preserved",
+			active_source_present ? "present" : "absent", active_source_present ? "" : " (bootstrap preserved)");
+	}
+	return pending;
+}
+
+static void restore_active_playlist_position(struct media_playlist_source *mps)
+{
+	size_t media_index;
+	size_t folder_item_index;
+	bool folder_item;
+	bool restore = false;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (mps->active_slot && mps->active_slot->source) {
+		media_index = mps->active_slot->media_index;
+		folder_item_index = mps->active_slot->folder_item_index;
+		folder_item = mps->active_slot->folder_item;
+		restore = true;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (!restore)
+		return;
+
+	pthread_mutex_lock(&mps->mutex);
+	set_current_media_index(mps, media_index);
+	set_current_folder_item_index(mps, folder_item ? folder_item_index : 0);
+	pthread_mutex_unlock(&mps->mutex);
+}
+
+static void rebind_active_slot_metadata(struct media_playlist_source *mps)
+{
+	struct media_source_slot *slot;
+	char *media_id = NULL;
+	char *folder_item_filename = NULL;
+	char *path = NULL;
+	uint64_t source_generation = 0;
+	size_t media_index = 0;
+	size_t folder_item_index = 0;
+	bool folder_item = false;
+	bool is_url = false;
+	bool found = false;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	slot = mps->active_slot;
+	if (slot && slot->source && slot->media_id && slot->path) {
+		media_id = bstrdup(slot->media_id);
+		if (slot->folder_item_filename)
+			folder_item_filename = bstrdup(slot->folder_item_filename);
+		path = bstrdup(slot->path);
+		source_generation = slot->source_generation;
+		folder_item = slot->folder_item;
+		is_url = slot->is_url;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (!media_id || !path)
+		goto cleanup;
+
+	pthread_mutex_lock(&mps->mutex);
+	for (size_t i = 0; i < mps->files.num; i++) {
+		struct media_file_data *media = &mps->files.array[i];
+		if (strcmp(media->id, media_id) != 0)
+			continue;
+		if (!folder_item) {
+			if (!media->is_folder && media->is_url == is_url && strcmp(media->path, path) == 0) {
+				media_index = i;
+				folder_item_index = 0;
+				found = true;
+			}
+			break;
+		}
+		if (!media->is_folder || !folder_item_filename)
+			break;
+		for (size_t j = 0; j < media->folder_items.num; j++) {
+			struct media_file_data *item = &media->folder_items.array[j];
+			if (item->is_url == is_url && strcmp(item->filename, folder_item_filename) == 0 &&
+			    strcmp(item->path, path) == 0) {
+				media_index = i;
+				folder_item_index = j;
+				found = true;
+				break;
+			}
+		}
+		break;
+	}
+	pthread_mutex_unlock(&mps->mutex);
+
+	if (found) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		if (mps->active_slot == slot && slot->source && slot->source_generation == source_generation) {
+			slot->media_index = media_index;
+			slot->folder_item_index = folder_item_index;
+			slot->folder_item = folder_item;
+		}
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+	}
+
+cleanup:
+	bfree(media_id);
+	bfree(folder_item_filename);
+	bfree(path);
+}
+
+static obs_data_t *create_media_settings(struct media_playlist_source *mps, const struct media_file_data *media,
+					 bool local_video)
+{
+	obs_data_t *settings = obs_data_create();
+	const char *path_setting = media->is_url ? S_FFMPEG_INPUT : S_FFMPEG_LOCAL_FILE;
+	bool restart_on_activate = local_video || (mps->visibility_behavior != VISIBILITY_BEHAVIOR_ALWAYS_PLAY &&
+						   mps->visibility_behavior != VISIBILITY_BEHAVIOR_PAUSE_UNPAUSE);
+
+	obs_data_set_bool(settings, "log_changes", false);
+	obs_data_set_bool(settings, S_FFMPEG_IS_LOCAL_FILE, !media->is_url);
+	obs_data_set_string(settings, path_setting, media->path);
+	obs_data_set_bool(settings, S_FFMPEG_HW_DECODE, mps->use_hw_decoding);
+	obs_data_set_bool(settings, S_FFMPEG_CLOSE_WHEN_INACTIVE, local_video ? false : mps->close_when_inactive);
+	obs_data_set_bool(settings, S_FFMPEG_RESTART_ON_ACTIVATE, restart_on_activate);
+	obs_data_set_bool(settings, S_FFMPEG_CLEAR_ON_MEDIA_END, true);
+	obs_data_set_bool(settings, S_FFMPEG_IS_STINGER, local_video);
+	obs_data_set_int(settings, S_SPEED, mps->speed);
+	return settings;
+}
+
+static bool create_media_slot(struct media_playlist_source *mps, struct media_source_slot *slot,
+			      const struct media_file_data *media, uint64_t request_generation)
+{
+	obs_data_t *settings;
+	obs_source_t *source;
+	struct media_source_callback_context *callback_context;
+	char *path;
+	uint64_t source_generation;
+	bool publish;
+	bool local_video = is_local_video(media);
+
+	destroy_media_slot(slot);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (mps->destroying || mps->resetting || slot != mps->standby_slot) {
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		return false;
+	}
+	source_generation = ++mps->next_source_generation;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	settings = create_media_settings(mps, media, local_video);
+	source = obs_source_create_private("ffmpeg_source", "media_playlist_slot", settings);
+	obs_data_release(settings);
+	if (!source)
+		return false;
+	callback_context = bzalloc(sizeof(*callback_context));
+	path = bstrdup(media->path);
+	callback_context->slot = slot;
+	callback_context->source_generation = source_generation;
+
+	obs_source_add_audio_capture_callback(source, mps_audio_callback, callback_context);
+	signal_handler_connect(obs_source_get_signal_handler(source), "media_ended", media_source_ended,
+			       callback_context);
+	signal_handler_connect(obs_source_get_signal_handler(source), "media_started", media_source_started,
+			       callback_context);
+
+	if (local_video) {
+		calldata_t cd = {0};
+		proc_handler_call(obs_source_get_proc_handler(source), "preload_first_frame", &cd);
+		calldata_free(&cd);
+	}
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	publish = !mps->destroying && !mps->resetting && slot == mps->standby_slot &&
+		  (request_generation ? mps_coordinator_matches(&mps->coordinator, request_generation)
+				      : !mps->coordinator.request_pending);
+	if (publish) {
+		slot->source = source;
+		slot->callback_context = callback_context;
+		slot->path = path;
+		slot->source_generation = source_generation;
+		slot->request_generation = request_generation;
+		slot->is_url = media->is_url;
+		slot->local_video = local_video;
+		slot->child_added = false;
+		slot->manual_showing = false;
+		slot->start_requested = false;
+		slot->started = false;
+		slot->failed = callback_context->ended_before_publish;
+		slot->ended = false;
+		slot->ended_handled = false;
+		slot->expected_stop = false;
+		slot->produced_output = false;
+		slot->audio_enabled = false;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (!publish) {
+		obs_source_remove_audio_capture_callback(source, mps_audio_callback, callback_context);
+		signal_handler_disconnect(obs_source_get_signal_handler(source), "media_ended", media_source_ended,
+					  callback_context);
+		signal_handler_disconnect(obs_source_get_signal_handler(source), "media_started", media_source_started,
+					  callback_context);
+		obs_source_release(source);
+		bfree(callback_context);
+		bfree(path);
+	}
+	return publish;
+}
+
+static void configure_active_media_source(struct media_playlist_source *mps, obs_source_t *source)
+{
+	obs_data_t *settings = obs_source_get_settings(source);
+	bool restart_on_activate = mps->visibility_behavior != VISIBILITY_BEHAVIOR_ALWAYS_PLAY &&
+				   mps->visibility_behavior != VISIBILITY_BEHAVIOR_PAUSE_UNPAUSE;
+
+	obs_data_set_bool(settings, S_FFMPEG_CLEAR_ON_MEDIA_END, false);
+	obs_data_set_bool(settings, S_FFMPEG_CLOSE_WHEN_INACTIVE, mps->close_when_inactive);
+	obs_data_set_bool(settings, S_FFMPEG_RESTART_ON_ACTIVATE, restart_on_activate);
+	obs_source_update(source, settings);
+	obs_data_release(settings);
+}
+
+static void disable_restart_on_activate(obs_source_t *source)
+{
+	obs_data_t *settings = obs_source_get_settings(source);
+
+	obs_data_set_bool(settings, S_FFMPEG_RESTART_ON_ACTIVATE, false);
+	obs_source_update(source, settings);
+	obs_data_release(settings);
+}
+
 static void update_current_filename_setting(struct media_playlist_source *mps, obs_data_t *data)
 {
 	struct dstr long_desc = {0};
@@ -184,12 +585,27 @@ static void update_current_filename_setting(struct media_playlist_source *mps, o
 static void clear_media_source(void *data)
 {
 	struct media_playlist_source *mps = data;
-	obs_data_t *settings = obs_data_create();
-	obs_data_set_bool(settings, S_FFMPEG_IS_LOCAL_FILE, true);
-	obs_data_set_string(settings, S_FFMPEG_INPUT, "");
-	obs_data_set_string(settings, S_FFMPEG_LOCAL_FILE, "");
-	obs_source_update(mps->current_media_source, settings);
-	obs_data_release(settings);
+	obs_source_t *active_source;
+	bool was_resetting;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	was_resetting = mps->resetting;
+	mps->resetting = true;
+	mps_coordinator_cancel(&mps->coordinator);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	active_source = detach_active_source(mps);
+
+	if (active_source) {
+		obs_source_release(active_source);
+	}
+
+	destroy_media_slot(&mps->media_slots[0]);
+	destroy_media_slot(&mps->media_slots[1]);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->active_slot = NULL;
+	mps->standby_slot = &mps->media_slots[0];
+	mps->resetting = was_resetting;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 	obs_source_media_stop(mps->source);
 }
 
@@ -205,8 +621,10 @@ static void clear_media_source(void *data)
 static void update_media_source(void *data, bool forced)
 {
 	struct media_playlist_source *mps = data;
-	obs_source_t *media_source = mps->current_media_source;
-	obs_data_t *settings = obs_source_get_settings(media_source);
+
+	if (!forced || !mps->current_media)
+		return;
+
 	if (mps->current_media->is_folder) {
 		assert(mps->current_folder_item_index < mps->current_media->folder_items.num);
 		mps->actual_media = &mps->current_media->folder_items.array[mps->current_folder_item_index];
@@ -214,41 +632,27 @@ static void update_media_source(void *data, bool forced)
 		mps->current_folder_item_index = 0;
 		mps->actual_media = mps->current_media;
 	}
+}
 
-	// if path is same, we have to force restart it, otherwise it doesn't restart
-	bool old_is_url = !obs_data_get_bool(settings, S_FFMPEG_IS_LOCAL_FILE);
-	const char *old_path_setting = old_is_url ? S_FFMPEG_INPUT : S_FFMPEG_LOCAL_FILE;
-	const char *old_path = obs_data_get_string(settings, old_path_setting);
-	bool should_restart = strcmp(old_path, mps->actual_media->path) == 0;
-
-	//bool current_is_url =
-	//	!obs_data_get_bool(settings, S_FFMPEG_IS_LOCAL_FILE);
-	const char *path_setting = mps->actual_media->is_url ? S_FFMPEG_INPUT : S_FFMPEG_LOCAL_FILE;
-
-	/*forced = forced || current_is_url != mps->current_media->is_url;
-	if (!forced) {
-		const char *path = obs_data_get_string(settings, path_setting);
-		forced = strcmp(path, mps->current_media->path) != 0;
-	}*/
-
-	if (forced) {
-		obs_data_set_bool(settings, S_FFMPEG_IS_LOCAL_FILE, !mps->actual_media->is_url);
-		obs_data_set_string(settings, path_setting, mps->actual_media->path);
-		obs_data_set_int(settings, S_SPEED, mps->speed);
-		obs_source_update(media_source, settings);
-		mps->user_stopped = false;
-
-		if (should_restart) {
-			obs_source_media_restart(media_source);
-		}
-	}
-
-	obs_data_release(settings);
+static void request_media_switch(struct media_playlist_source *mps, enum mps_switch_request request,
+				 bool preserve_failures)
+{
+	size_t candidate_limit = get_total_file_count(mps);
+	if (!candidate_limit)
+		return;
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps_coordinator_request(&mps->coordinator, request, candidate_limit, preserve_failures);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 }
 
 static void select_index_proc_(struct media_playlist_source *mps, size_t media_index, size_t folder_item_index)
 {
 	if (media_index < mps->files.num) {
+		obs_source_t *active_source = get_active_source_ref(mps);
+		if (active_source) {
+			obs_source_media_play_pause(active_source, true);
+			obs_source_release(active_source);
+		}
 		pthread_mutex_lock(&mps->mutex);
 		set_current_media_index(mps, media_index);
 		set_current_folder_item_index(mps, folder_item_index);
@@ -257,6 +661,9 @@ static void select_index_proc_(struct media_playlist_source *mps, size_t media_i
 			if (mps->shuffle) {
 				shuffler_select(&mps->shuffler, mps->actual_media);
 			}
+			pthread_mutex_lock(&mps->lifecycle_mutex);
+			mps_coordinator_request(&mps->coordinator, MPS_SWITCH_SELECT, 1, false);
+			pthread_mutex_unlock(&mps->lifecycle_mutex);
 		}
 		pthread_mutex_unlock(&mps->mutex);
 	}
@@ -342,13 +749,10 @@ static void set_media_state(void *data, enum obs_media_state state)
 static enum obs_media_state mps_get_state(void *data)
 {
 	struct media_playlist_source *mps = data;
-	enum obs_media_state media_state;
-	if (get_total_file_count(mps) > 0) {
-		media_state = obs_source_media_get_state(mps->current_media_source);
-	} else {
-		media_state = OBS_MEDIA_STATE_NONE;
-	}
-	UNUSED_PARAMETER(mps);
+	obs_source_t *source = get_active_source_ref(mps);
+	enum obs_media_state media_state = source ? obs_source_media_get_state(source) : OBS_MEDIA_STATE_NONE;
+	if (source)
+		obs_source_release(source);
 	return media_state;
 }
 
@@ -364,31 +768,51 @@ static void mps_end_reached(void *data)
 static void media_source_ended(void *data, calldata_t *cd)
 {
 	UNUSED_PARAMETER(cd);
-	struct media_playlist_source *mps = data;
+	struct media_source_callback_context *context = data;
+	struct media_source_slot *slot = context->slot;
+	struct media_playlist_source *mps = slot->owner;
 
-	/* In OBS 29.1.3 and below, stopping a currently playing media source triggers
-	 * both the STOPPED and ENDED signals. In the future, it should actually just
-	 * be STOPPED. TODO: Remove `user_stopped` if PR #9218 gets merged.
-	 *
-	 * EDIT: Tested in OBS 31, now problem is deactivate is sending an ENDED signal
-	 * rather than a STOPPED. So in mps_deactivate, we set user_stopped to true
-	 */
-	if (mps->user_stopped) {
-		mps->user_stopped = false;
-		return;
-	} else if (mps->current_media_index < mps->files.num - 1 || mps->loop) {
-		obs_source_media_next(mps->source);
-	} else {
-		mps_end_reached(mps);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (slot->source && slot->source_generation == context->source_generation && !slot->expected_stop) {
+		if (slot == mps->active_slot)
+			slot->ended = true;
+		else
+			slot->failed = true;
+	} else if (!slot->source) {
+		context->ended_before_publish = true;
 	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+}
+
+static void media_source_started(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	struct media_source_callback_context *context = data;
+	struct media_source_slot *slot = context->slot;
+	struct media_playlist_source *mps = slot->owner;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (slot->source && slot->source_generation == context->source_generation)
+		slot->started = true;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 }
 
 void mps_audio_callback(void *data, obs_source_t *source, const struct audio_data *audio_data, bool muted)
 {
 	UNUSED_PARAMETER(muted);
-	UNUSED_PARAMETER(source);
-	struct media_playlist_source *mps = data;
+	struct media_source_callback_context *context = data;
+	struct media_source_slot *slot = context->slot;
+	struct media_playlist_source *mps = slot->owner;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (slot != mps->active_slot || source != slot->source || !slot->audio_enabled || slot->expected_stop ||
+	    context->source_generation != slot->source_generation) {
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		return;
+	}
 	pthread_mutex_lock(&mps->audio_mutex);
+	slot->produced_output = true;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 	size_t size = audio_data->frames * sizeof(float);
 	for (size_t i = 0; i < mps->num_channels; i++) {
 		deque_push_back(&mps->audio_data[i], audio_data->data[i], size);
@@ -476,22 +900,33 @@ static void free_files(struct darray *array)
 static int64_t mps_get_duration(void *data)
 {
 	struct media_playlist_source *mps = data;
-
-	return obs_source_media_get_duration(mps->current_media_source);
+	obs_source_t *source = get_active_source_ref(mps);
+	int64_t duration = source ? obs_source_media_get_duration(source) : 0;
+	if (source)
+		obs_source_release(source);
+	return duration;
 }
 
 static int64_t mps_get_time(void *data)
 {
 	struct media_playlist_source *mps = data;
 
-	return obs_source_media_get_time(mps->current_media_source);
+	obs_source_t *source = get_active_source_ref(mps);
+	int64_t time = source ? obs_source_media_get_time(source) : 0;
+	if (source)
+		obs_source_release(source);
+	return time;
 }
 
 static void mps_set_time(void *data, int64_t ms)
 {
 	struct media_playlist_source *mps = data;
 
-	obs_source_media_set_time(mps->current_media_source, ms);
+	obs_source_t *source = get_active_source_ref(mps);
+	if (source) {
+		obs_source_media_set_time(source, ms);
+		obs_source_release(source);
+	}
 }
 
 static void play_pause_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -552,8 +987,20 @@ static void previous_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, 
 static void mps_play_pause(void *data, bool pause)
 {
 	struct media_playlist_source *mps = data;
+	obs_source_t *source = get_active_source_ref(mps);
 
-	obs_source_media_play_pause(mps->current_media_source, pause);
+	if (source) {
+		if (!pause) {
+			pthread_mutex_lock(&mps->lifecycle_mutex);
+			if (mps->active_slot) {
+				mps->active_slot->expected_stop = false;
+				mps->active_slot->audio_enabled = true;
+			}
+			pthread_mutex_unlock(&mps->lifecycle_mutex);
+		}
+		obs_source_media_play_pause(source, pause);
+		obs_source_release(source);
+	}
 	mps->paused = pause;
 
 	if (pause)
@@ -565,18 +1012,33 @@ static void mps_play_pause(void *data, bool pause)
 static void mps_restart(void *data)
 {
 	struct media_playlist_source *mps = data;
+	obs_source_t *source;
+	bool restart_current = mps->restart_behavior == RESTART_BEHAVIOR_CURRENT_FILE;
 
-	mps->user_stopped = false;
+	if (restart_current && cancel_pending_transition(mps, false, true))
+		restore_active_playlist_position(mps);
 
 	if (mps->restart_behavior == RESTART_BEHAVIOR_FIRST_FILE) {
 		play_media_at_index(mps, 0, false);
+		request_media_switch(mps, MPS_SWITCH_NEXT, false);
 	} else if (mps->restart_behavior == RESTART_BEHAVIOR_CURRENT_FILE) {
 		if (mps->state == OBS_MEDIA_STATE_ENDED) {
-			// Make sure that the first file is selected
-			// We do it here, because updating a media source will restart it
 			update_media_source(mps, true);
+			request_media_switch(mps, MPS_SWITCH_NEXT, false);
+			return;
 		}
-		obs_source_media_restart(mps->current_media_source);
+		source = get_active_source_ref(mps);
+		if (source) {
+			pthread_mutex_lock(&mps->lifecycle_mutex);
+			if (mps->active_slot) {
+				mps->active_slot->expected_stop = false;
+				mps->active_slot->audio_enabled = true;
+			}
+			pthread_mutex_unlock(&mps->lifecycle_mutex);
+			obs_source_media_restart(source);
+			obs_source_show_preloaded_video(source);
+			obs_source_release(source);
+		}
 		set_media_state(mps, OBS_MEDIA_STATE_PLAYING);
 	}
 }
@@ -584,9 +1046,25 @@ static void mps_restart(void *data)
 static void mps_stop(void *data)
 {
 	struct media_playlist_source *mps = data;
+	obs_source_t *source;
 
-	mps->user_stopped = true;
-	obs_source_media_stop(mps->current_media_source);
+	if (cancel_pending_transition(mps, false, false))
+		restore_active_playlist_position(mps);
+	source = get_active_source_ref(mps);
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	pthread_mutex_lock(&mps->audio_mutex);
+	if (mps->active_slot) {
+		mps->active_slot->expected_stop = true;
+		mps->active_slot->audio_enabled = false;
+	}
+	clear_audio_queues_locked(mps);
+	pthread_mutex_unlock(&mps->audio_mutex);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (source) {
+		obs_source_media_stop(source);
+		obs_source_release(source);
+	}
 	set_media_state(mps, OBS_MEDIA_STATE_STOPPED);
 }
 
@@ -594,9 +1072,31 @@ static void mps_playlist_next(void *data)
 {
 	struct media_playlist_source *mps = data;
 	bool last_folder_item_reached = false;
+	bool switched = false;
+	bool automatic;
+	bool retrying;
 
 	if (!get_total_file_count(mps))
 		return;
+	if (!playlist_has_next(mps))
+		return;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	automatic = mps->automatic_next_pending;
+	retrying = mps->retrying_switch;
+	mps->automatic_next_pending = false;
+	mps->retrying_switch = false;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	if (!automatic && !retrying) {
+		obs_source_t *active_source = get_active_source_ref(mps);
+		if (active_source) {
+			obs_source_media_play_pause(active_source, true);
+			obs_source_release(active_source);
+		}
+
+		mute_active_audio(mps);
+	}
 
 	pthread_mutex_lock(&mps->mutex);
 	if (mps->shuffle) {
@@ -615,6 +1115,7 @@ static void mps_playlist_next(void *data)
 			mps->current_media_index = mps->current_media->index;
 			update_media_source(mps, true);
 			obs_source_save(mps->source);
+			switched = true;
 		}
 		goto end;
 	}
@@ -624,6 +1125,7 @@ static void mps_playlist_next(void *data)
 		    mps->current_folder_item_index < mps->current_media->folder_items.num - 1) {
 			++mps->current_folder_item_index;
 			play_folder_item_at_index(mps, mps->current_folder_item_index);
+			switched = true;
 			goto end;
 		} else {
 			last_folder_item_reached = true;
@@ -640,9 +1142,15 @@ static void mps_playlist_next(void *data)
 			goto end;
 		}
 		play_media_at_index(mps, mps->current_media_index, false);
+		switched = true;
 	}
 
 end:
+	if (switched) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		mps_coordinator_request(&mps->coordinator, MPS_SWITCH_NEXT, get_total_file_count(mps), retrying);
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+	}
 	pthread_mutex_unlock(&mps->mutex);
 }
 
@@ -650,9 +1158,28 @@ static void mps_playlist_prev(void *data)
 {
 	struct media_playlist_source *mps = data;
 	bool is_first_folder_item = false;
+	bool switched = false;
+	bool retrying;
 
 	if (!get_total_file_count(mps))
 		return;
+	if (!playlist_has_previous(mps))
+		return;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	retrying = mps->retrying_switch;
+	mps->retrying_switch = false;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	if (!retrying) {
+		obs_source_t *active_source = get_active_source_ref(mps);
+		if (active_source) {
+			obs_source_media_play_pause(active_source, true);
+			obs_source_release(active_source);
+		}
+
+		mute_active_audio(mps);
+	}
 
 	pthread_mutex_lock(&mps->mutex);
 	if (mps->shuffle) {
@@ -671,6 +1198,7 @@ static void mps_playlist_prev(void *data)
 			mps->current_media_index = mps->current_media->index;
 			update_media_source(mps, true);
 			obs_source_save(mps->source);
+			switched = true;
 		}
 		goto end;
 	}
@@ -679,6 +1207,7 @@ static void mps_playlist_prev(void *data)
 		if (mps->current_folder_item_index > 0) {
 			--mps->current_folder_item_index;
 			play_folder_item_at_index(mps, mps->current_folder_item_index);
+			switched = true;
 			goto end;
 		} else {
 			is_first_folder_item = true;
@@ -694,9 +1223,15 @@ static void mps_playlist_prev(void *data)
 			goto end;
 		}
 		play_media_at_index(mps, mps->current_media_index, is_first_folder_item);
+		switched = true;
 	}
 
 end:
+	if (switched) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		mps_coordinator_request(&mps->coordinator, MPS_SWITCH_PREVIOUS, get_total_file_count(mps), retrying);
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+	}
 	pthread_mutex_unlock(&mps->mutex);
 }
 
@@ -706,7 +1241,12 @@ static void mps_activate(void *data)
 	if (!get_total_file_count(mps))
 		return;
 
-	mps->user_stopped = false;
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (mps->active_slot) {
+		mps->active_slot->expected_stop = false;
+		mps->active_slot->audio_enabled = true;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 	if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_STOP_RESTART) {
 		obs_source_media_restart(mps->source);
 	} else if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_PAUSE_UNPAUSE) {
@@ -721,12 +1261,10 @@ static void mps_deactivate(void *data)
 	struct media_playlist_source *mps = data;
 
 	if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_STOP_RESTART) {
-		mps->user_stopped = true;
 		obs_source_media_stop(mps->source);
 	} else if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_PAUSE_UNPAUSE) {
 		obs_source_media_play_pause(mps->source, true);
 	} else if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_STOP_PLAY_NEXT) {
-		mps->user_stopped = true;
 		obs_source_media_stop(mps->source);
 		obs_source_media_next(mps->source);
 	}
@@ -735,17 +1273,26 @@ static void mps_deactivate(void *data)
 static void mps_destroy(void *data)
 {
 	struct media_playlist_source *mps = data;
+	obs_source_t *active_source;
 
-	obs_source_release(mps->current_media_source);
+	if (!mps)
+		return;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->destroying = true;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	active_source = detach_active_source(mps);
+	if (active_source) {
+		obs_source_release(active_source);
+	}
+
+	destroy_media_slot(&mps->media_slots[0]);
+	destroy_media_slot(&mps->media_slots[1]);
 	shuffler_destroy(&mps->shuffler);
 	free_files(&mps->files.da);
-	for (size_t i = 0; i < MAX_AUDIO_CHANNELS; i++) {
-		deque_free(&mps->audio_data[i]);
-	}
-	deque_free(&mps->audio_frames);
-	deque_free(&mps->audio_timestamps);
 	pthread_mutex_destroy(&mps->mutex);
 	pthread_mutex_destroy(&mps->audio_mutex);
+	pthread_mutex_destroy(&mps->lifecycle_mutex);
 	bfree(mps->current_media_filename);
 	bfree(mps);
 }
@@ -758,19 +1305,21 @@ static void *mps_create(obs_data_t *settings, obs_source_t *source)
 
 	mps->first_update = true;
 	mps->source = source;
+	pthread_mutex_init_value(&mps->mutex);
+	pthread_mutex_init_value(&mps->audio_mutex);
+	pthread_mutex_init_value(&mps->lifecycle_mutex);
+	if (pthread_mutex_init(&mps->lifecycle_mutex, NULL) != 0)
+		goto allocation_error;
+	if (pthread_mutex_init(&mps->audio_mutex, NULL) != 0)
+		goto audio_mutex_error;
+	if (pthread_mutex_init(&mps->mutex, NULL) != 0)
+		goto mutex_error;
 
 	shuffler_init(&mps->shuffler);
-
-	/* Internal media source */
-	obs_data_t *media_source_data = obs_data_create();
-	obs_data_set_bool(media_source_data, "log_changes", false);
-	mps->current_media_source =
-		obs_source_create_private("ffmpeg_source", "current_media_source", media_source_data);
-	obs_source_add_active_child(mps->source, mps->current_media_source);
-	obs_source_add_audio_capture_callback(mps->current_media_source, mps_audio_callback, mps);
-
-	signal_handler_t *sh_media_source = obs_source_get_signal_handler(mps->current_media_source);
-	signal_handler_connect(sh_media_source, "media_ended", media_source_ended, mps);
+	mps_coordinator_init(&mps->coordinator);
+	for (size_t i = 0; i < 2; i++)
+		mps->media_slots[i].owner = mps;
+	mps->standby_slot = &mps->media_slots[0];
 
 	mps->paused = false;
 
@@ -792,29 +1341,25 @@ static void *mps_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
 	proc_handler_add(ph, "void select_index(int media_index, int folder_item_index)", select_index_proc, mps);
 
-	pthread_mutex_init_value(&mps->mutex);
-	if (pthread_mutex_init(&mps->mutex, NULL) != 0)
-		goto error;
-
-	pthread_mutex_init_value(&mps->audio_mutex);
-	if (pthread_mutex_init(&mps->audio_mutex, NULL) != 0)
-		goto error;
-
 	obs_source_update(source, NULL);
-
-	obs_data_release(media_source_data);
 	return mps;
 
-error:
-	mps_destroy(mps);
+mutex_error:
+	pthread_mutex_destroy(&mps->audio_mutex);
+audio_mutex_error:
+	pthread_mutex_destroy(&mps->lifecycle_mutex);
+allocation_error:
+	bfree(mps);
 	return NULL;
 }
 
 static void mps_video_render(void *data, gs_effect_t *effect)
 {
 	struct media_playlist_source *mps = data;
-	if (mps->actual_media) {
-		obs_source_video_render(mps->current_media_source);
+	obs_source_t *source = get_active_source_ref(mps);
+	if (source) {
+		obs_source_video_render(source);
+		obs_source_release(source);
 	} else {
 		obs_source_video_render(NULL);
 	}
@@ -826,20 +1371,23 @@ static bool mps_audio_render(void *data, uint64_t *ts_out, struct obs_source_aud
 			     size_t channels, size_t sample_rate)
 {
 	struct media_playlist_source *mps = data;
-	if (!mps->current_media_source)
+	obs_source_t *source = get_active_source_ref(mps);
+	if (!source)
 		return false;
 
 	struct obs_source_audio_mix child_audio;
 	uint64_t source_ts;
 
-	/*if (obs_source_audio_pending(mps->current_media_source))
+	/*if (obs_source_audio_pending(source))
 		return false;*/
 
-	source_ts = obs_source_get_audio_timestamp(mps->current_media_source);
-	if (!source_ts)
+	source_ts = obs_source_get_audio_timestamp(source);
+	if (!source_ts) {
+		obs_source_release(source);
 		return false;
+	}
 
-	obs_source_get_audio_mix(mps->current_media_source, &child_audio);
+	obs_source_get_audio_mix(source, &child_audio);
 	for (size_t mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
 		if ((mixers & (1 << mix)) == 0)
 			continue;
@@ -853,16 +1401,561 @@ static bool mps_audio_render(void *data, uint64_t *ts_out, struct obs_source_aud
 	}
 
 	*ts_out = source_ts;
+	obs_source_release(source);
 
 	UNUSED_PARAMETER(sample_rate);
 	return true;
 }
 
+struct media_target {
+	char *path;
+	bool is_url;
+};
+
+static void free_media_target(struct media_target *target)
+{
+	bfree(target->path);
+	target->path = NULL;
+}
+
+static bool copy_media_target(const struct media_file_data *media, struct media_target *target)
+{
+	if (!media || !media->path)
+		return false;
+	target->path = bstrdup(media->path);
+	target->is_url = media->is_url;
+	return true;
+}
+
+static bool copy_current_target(struct media_playlist_source *mps, struct media_target *target)
+{
+	bool copied;
+	pthread_mutex_lock(&mps->mutex);
+	copied = copy_media_target(mps->actual_media, target);
+	pthread_mutex_unlock(&mps->mutex);
+	return copied;
+}
+
+static struct media_file_data *next_sequential_media(struct media_playlist_source *mps)
+{
+	if (mps->current_media && mps->current_media->is_folder &&
+	    mps->current_folder_item_index + 1 < mps->current_media->folder_items.num)
+		return &mps->current_media->folder_items.array[mps->current_folder_item_index + 1];
+
+	if (!mps->files.num)
+		return NULL;
+
+	for (size_t offset = 1; offset <= mps->files.num; offset++) {
+		size_t index = mps->current_media_index + offset;
+		if (index >= mps->files.num) {
+			if (!mps->loop)
+				return NULL;
+			index %= mps->files.num;
+		}
+
+		struct media_file_data *media = &mps->files.array[index];
+		if (!media->is_folder)
+			return media;
+		if (media->folder_items.num)
+			return &media->folder_items.array[0];
+	}
+	return NULL;
+}
+
+static bool copy_next_target(struct media_playlist_source *mps, struct media_target *target)
+{
+	struct media_file_data *media = NULL;
+	bool copied = false;
+
+	pthread_mutex_lock(&mps->mutex);
+	if (mps->shuffle) {
+		if (shuffler_has_next(&mps->shuffler))
+			media = shuffler_peek_next(&mps->shuffler);
+	} else {
+		media = next_sequential_media(mps);
+	}
+	if (media)
+		copied = copy_media_target(media, target);
+	pthread_mutex_unlock(&mps->mutex);
+	return copied;
+}
+
+static bool target_is_local_video(const struct media_target *target)
+{
+	struct media_file_data media = {0};
+	media.path = target->path;
+	media.is_url = target->is_url;
+	return is_local_video(&media);
+}
+
+static bool slot_matches_target(struct media_playlist_source *mps, struct media_source_slot *slot,
+				const struct media_target *target)
+{
+	bool matches;
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	matches = slot && slot->source && !slot->failed && slot->path && strcmp(slot->path, target->path) == 0;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	return matches;
+}
+
+static obs_source_t *get_slot_source_ref_and_active(struct media_playlist_source *mps, struct media_source_slot *slot,
+						    bool *active)
+{
+	obs_source_t *source = NULL;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	*active = slot && slot == mps->active_slot;
+	if (slot && slot->source)
+		source = obs_source_get_ref(slot->source);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	return source;
+}
+
+static bool slot_has_failed(struct media_playlist_source *mps, struct media_source_slot *slot)
+{
+	bool failed;
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	failed = !slot || slot->failed;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	return failed;
+}
+
+static void prepare_next_media(struct media_playlist_source *mps)
+{
+	struct media_target target = {0};
+	struct media_file_data media = {0};
+	struct media_source_slot *standby;
+	bool request_pending;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	request_pending = mps->coordinator.request_pending;
+	standby = mps->standby_slot;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (request_pending || !standby)
+		return;
+	if (!copy_next_target(mps, &target)) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		mps->prefetch_dirty = false;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		return;
+	}
+	if (!target_is_local_video(&target)) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		mps->prefetch_dirty = false;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		free_media_target(&target);
+		return;
+	}
+
+	media.path = target.path;
+	media.is_url = target.is_url;
+	create_media_slot(mps, standby, &media, 0);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->prefetch_dirty = false;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	free_media_target(&target);
+}
+
+static bool activate_and_cut(struct media_playlist_source *mps, struct media_source_slot *slot,
+			     uint64_t request_generation)
+{
+	obs_source_t *new_source = get_slot_source_ref(mps, slot);
+	obs_source_t *old_source = get_active_source_ref(mps);
+	struct media_source_slot *old_slot;
+	char *media_id = NULL;
+	char *folder_item_filename = NULL;
+	size_t media_index;
+	size_t folder_item_index;
+	bool folder_item;
+	bool child_added;
+	bool start_requested;
+	bool started;
+	bool start_now;
+	bool request_start;
+	bool manual_showing_needed;
+	bool valid;
+
+	if (!new_source) {
+		if (old_source)
+			obs_source_release(old_source);
+		return false;
+	}
+	pthread_mutex_lock(&mps->mutex);
+	media_index = mps->current_media_index;
+	folder_item_index = mps->current_folder_item_index;
+	folder_item = mps->current_media && mps->current_media->is_folder;
+	if (mps->current_media)
+		media_id = bstrdup(mps->current_media->id);
+	if (folder_item && mps->actual_media)
+		folder_item_filename = bstrdup(mps->actual_media->filename);
+	pthread_mutex_unlock(&mps->mutex);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	valid = slot->source == new_source && mps_coordinator_matches(&mps->coordinator, request_generation);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (!valid) {
+		obs_source_release(new_source);
+		if (old_source)
+			obs_source_release(old_source);
+		bfree(media_id);
+		bfree(folder_item_filename);
+		return false;
+	}
+
+	if (slot->local_video) {
+		obs_source_show_preloaded_video(new_source);
+		if (!obs_source_get_width(new_source) || !obs_source_get_height(new_source)) {
+			obs_source_release(new_source);
+			if (old_source)
+				obs_source_release(old_source);
+			bfree(media_id);
+			bfree(folder_item_filename);
+			return false;
+		}
+
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		child_added = slot->child_added;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		if (!child_added) {
+			obs_source_add_active_child(mps->source, new_source);
+			pthread_mutex_lock(&mps->lifecycle_mutex);
+			if (slot->source == new_source)
+				slot->child_added = true;
+			pthread_mutex_unlock(&mps->lifecycle_mutex);
+		}
+
+		if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_ALWAYS_PLAY && !obs_source_showing(mps->source)) {
+			pthread_mutex_lock(&mps->lifecycle_mutex);
+			manual_showing_needed = slot->source == new_source && !slot->manual_showing;
+			if (manual_showing_needed)
+				slot->manual_showing = true;
+			pthread_mutex_unlock(&mps->lifecycle_mutex);
+			if (manual_showing_needed)
+				obs_source_inc_showing(new_source);
+		}
+
+		start_now = mps->visibility_behavior == VISIBILITY_BEHAVIOR_ALWAYS_PLAY ||
+			    (mps->visibility_behavior == VISIBILITY_BEHAVIOR_PAUSE_UNPAUSE &&
+			     obs_source_showing(mps->source));
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		start_requested = slot->start_requested;
+		started = slot->started;
+		request_start = start_now && !start_requested && slot->source == new_source;
+		if (request_start)
+			slot->start_requested = true;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		if (request_start) {
+			/* Keep clear_on_media_end enabled until ffmpeg_source_start has shown B's preload. */
+			disable_restart_on_activate(new_source);
+			obs_source_media_restart(new_source);
+			obs_source_release(new_source);
+			if (old_source)
+				obs_source_release(old_source);
+			bfree(media_id);
+			bfree(folder_item_filename);
+			return false;
+		}
+		if (!started) {
+			obs_source_release(new_source);
+			if (old_source)
+				obs_source_release(old_source);
+			bfree(media_id);
+			bfree(folder_item_filename);
+			return false;
+		}
+
+		configure_active_media_source(mps, new_source);
+		obs_source_show_preloaded_video(new_source);
+		if (!obs_source_get_width(new_source) || !obs_source_get_height(new_source)) {
+			obs_source_release(new_source);
+			if (old_source)
+				obs_source_release(old_source);
+			destroy_media_slot(slot);
+			bfree(media_id);
+			bfree(folder_item_filename);
+			return false;
+		}
+	}
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	valid = slot->source == new_source && !slot->failed &&
+		mps_coordinator_matches(&mps->coordinator, request_generation);
+	old_slot = mps->active_slot;
+	if (valid) {
+		pthread_mutex_lock(&mps->audio_mutex);
+		clear_audio_queues_locked(mps);
+		if (old_slot)
+			old_slot->expected_stop = true;
+		slot->expected_stop = false;
+		slot->audio_enabled = true;
+		slot->media_index = media_index;
+		slot->folder_item_index = folder_item_index;
+		slot->folder_item = folder_item;
+		bfree(slot->media_id);
+		bfree(slot->folder_item_filename);
+		slot->media_id = media_id;
+		slot->folder_item_filename = folder_item_filename;
+		media_id = NULL;
+		folder_item_filename = NULL;
+		mps->active_slot = slot;
+		mps->standby_slot =
+			old_slot ? old_slot
+				 : (slot == &mps->media_slots[0] ? &mps->media_slots[1] : &mps->media_slots[0]);
+		mps_coordinator_complete(&mps->coordinator, request_generation);
+		pthread_mutex_unlock(&mps->audio_mutex);
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	if (!valid) {
+		obs_source_release(new_source);
+		if (old_source)
+			obs_source_release(old_source);
+		destroy_media_slot(slot);
+		bfree(media_id);
+		bfree(folder_item_filename);
+		return false;
+	}
+	if (!slot->local_video) {
+		obs_source_add_active_child(mps->source, new_source);
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		if (slot->source == new_source)
+			slot->child_added = true;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+	}
+
+	if (old_source) {
+		obs_source_release(old_source);
+	}
+	obs_source_release(new_source);
+	bfree(media_id);
+	bfree(folder_item_filename);
+
+	if (old_slot)
+		destroy_media_slot(old_slot);
+	mps->paused = false;
+	set_media_state(mps, OBS_MEDIA_STATE_PLAYING);
+	prepare_next_media(mps);
+	return true;
+}
+
+static void queue_retry(struct media_playlist_source *mps, enum mps_switch_request request)
+{
+	bool can_retry = request == MPS_SWITCH_PREVIOUS ? playlist_has_previous(mps) : playlist_has_next(mps);
+	if (!can_retry) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		mps_coordinator_cancel(&mps->coordinator);
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		mps_end_reached(mps);
+		return;
+	}
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->retrying_switch = true;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (request == MPS_SWITCH_PREVIOUS)
+		obs_source_media_previous(mps->source);
+	else
+		obs_source_media_next(mps->source);
+}
+
+static void handle_preload_failure(struct media_playlist_source *mps, struct media_source_slot *slot,
+				   uint64_t request_generation)
+{
+	enum mps_switch_request request;
+	enum mps_switch_failure failure;
+	uint64_t generation;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	generation = request_generation ? request_generation : (slot ? slot->request_generation : 0);
+	request = mps->coordinator.request;
+	failure = mps_coordinator_fail(&mps->coordinator, generation);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (slot)
+		destroy_media_slot(slot);
+
+	if (failure == MPS_SWITCH_FAILURE_RETRY && (request == MPS_SWITCH_NEXT || request == MPS_SWITCH_PREVIOUS)) {
+		queue_retry(mps, request);
+	} else if (failure == MPS_SWITCH_FAILURE_EXHAUSTED) {
+		mps_end_reached(mps);
+	}
+}
+
+static void prepare_requested_media(struct media_playlist_source *mps)
+{
+	struct media_target target = {0};
+	struct media_file_data media = {0};
+	struct media_source_slot *standby;
+	uint64_t generation;
+	enum mps_switch_request request;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (!mps_coordinator_take_request(&mps->coordinator, &generation, &request)) {
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		return;
+	}
+	standby = mps->standby_slot;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	if (!standby || !copy_current_target(mps, &target)) {
+		handle_preload_failure(mps, standby, generation);
+		return;
+	}
+
+	if (slot_matches_target(mps, standby, &target)) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		standby->request_generation = generation;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		free_media_target(&target);
+		return;
+	}
+
+	media.path = target.path;
+	media.is_url = target.is_url;
+	if (!create_media_slot(mps, standby, &media, generation)) {
+		free_media_target(&target);
+		handle_preload_failure(mps, standby, generation);
+		return;
+	}
+	free_media_target(&target);
+
+	if (slot_has_failed(mps, standby)) {
+		handle_preload_failure(mps, standby, generation);
+	} else if (!standby->local_video) {
+		activate_and_cut(mps, standby, generation);
+	}
+}
+
+static bool playlist_has_next(struct media_playlist_source *mps)
+{
+	bool has_next;
+	pthread_mutex_lock(&mps->mutex);
+	if (mps->shuffle) {
+		has_next = shuffler_has_next(&mps->shuffler);
+	} else {
+		has_next = next_sequential_media(mps) != NULL;
+	}
+	pthread_mutex_unlock(&mps->mutex);
+	return has_next;
+}
+
+static bool playlist_has_previous(struct media_playlist_source *mps)
+{
+	bool has_previous;
+	pthread_mutex_lock(&mps->mutex);
+	if (mps->shuffle) {
+		has_previous = shuffler_has_prev(&mps->shuffler);
+	} else {
+		has_previous = mps->current_media &&
+			       ((mps->current_media->is_folder && mps->current_folder_item_index > 0) ||
+				mps->current_media_index > 0 || (mps->loop && mps->files.num > 0));
+	}
+	pthread_mutex_unlock(&mps->mutex);
+	return has_previous;
+}
+
+static void process_slot_events(struct media_playlist_source *mps)
+{
+	struct media_source_slot *active;
+	struct media_source_slot *standby;
+	bool active_ended = false;
+	bool active_produced = false;
+	bool standby_failed = false;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	active = mps->active_slot;
+	standby = mps->standby_slot;
+	if (active && active->ended && !active->ended_handled) {
+		active->ended_handled = true;
+		active_ended = true;
+		active_produced = active->produced_output;
+	}
+	if (standby && standby->failed)
+		standby_failed = true;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	if (standby_failed) {
+		handle_preload_failure(mps, standby, 0);
+		return;
+	}
+
+	if (!active_ended)
+		return;
+	if (active_produced) {
+		mps->consecutive_failures = 0;
+	} else if (++mps->consecutive_failures >= get_total_file_count(mps)) {
+		mps_end_reached(mps);
+		return;
+	}
+
+	if (playlist_has_next(mps)) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		mps->automatic_next_pending = true;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		obs_source_media_next(mps->source);
+	} else {
+		mps_end_reached(mps);
+	}
+}
+
 static void mps_video_tick(void *data, float seconds)
 {
 	struct media_playlist_source *mps = data;
-	//UNUSED_PARAMETER(data);
+	struct media_source_slot *standby;
+	obs_source_t *standby_source;
+	uint64_t request_generation;
+	bool failed;
+	bool local_video;
+	bool refresh_prefetch;
+	bool request_pending;
+	bool resetting;
 	UNUSED_PARAMETER(seconds);
+	obs_source_t *active_source = get_active_source_ref(mps);
+	if (active_source) {
+		if (obs_source_get_width(active_source) && obs_source_get_height(active_source)) {
+			pthread_mutex_lock(&mps->lifecycle_mutex);
+			if (mps->active_slot && mps->active_slot->source == active_source)
+				mps->active_slot->produced_output = true;
+			pthread_mutex_unlock(&mps->lifecycle_mutex);
+		}
+		obs_source_release(active_source);
+	}
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	resetting = mps->resetting;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (!resetting) {
+		process_slot_events(mps);
+		prepare_requested_media(mps);
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		refresh_prefetch = mps->prefetch_dirty;
+		request_pending = mps->coordinator.request_pending;
+		standby = mps->standby_slot;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		if (refresh_prefetch && !request_pending) {
+			destroy_media_slot(standby);
+			prepare_next_media(mps);
+		}
+
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		standby = mps->standby_slot;
+		request_generation = standby ? standby->request_generation : 0;
+		failed = standby && standby->failed;
+		local_video = standby && standby->local_video;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+		standby_source = get_slot_source_ref(mps, standby);
+		if (standby_source && local_video && !failed) {
+			obs_source_show_preloaded_video(standby_source);
+			if (obs_source_get_width(standby_source) && obs_source_get_height(standby_source)) {
+				pthread_mutex_lock(&mps->lifecycle_mutex);
+				if (standby->source == standby_source)
+					standby->produced_output = true;
+				pthread_mutex_unlock(&mps->lifecycle_mutex);
+				if (request_generation)
+					activate_and_cut(mps, standby, request_generation);
+			}
+			obs_source_release(standby_source);
+		}
+	}
 
 	const audio_t *a = obs_get_audio();
 	const struct audio_output_info *aoi = audio_output_get_info(a);
@@ -934,22 +2027,60 @@ static void mps_video_tick(void *data, float seconds)
 static void mps_enum_sources(void *data, obs_source_enum_proc_t cb, void *param)
 {
 	struct media_playlist_source *mps = data;
+	obs_source_t *sources[2] = {0};
+	size_t source_count = 0;
 
-	pthread_mutex_lock(&mps->mutex);
-	cb(mps->source, mps->current_media_source, param);
-	pthread_mutex_unlock(&mps->mutex);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	for (size_t i = 0; i < 2; i++) {
+		struct media_source_slot *slot = &mps->media_slots[i];
+		bool active_slot = slot == mps->active_slot;
+		bool standby_slot = slot == mps->standby_slot;
+		bool duplicate = false;
+		obs_source_t *source;
+
+		if ((!active_slot && !standby_slot) || !slot->source ||
+		    !mps_source_is_active_child(active_slot, slot->child_added))
+			continue;
+
+		for (size_t j = 0; j < source_count; j++) {
+			if (sources[j] == slot->source) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+
+		source = obs_source_get_ref(slot->source);
+		if (source)
+			sources[source_count++] = source;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	for (size_t i = 0; i < source_count; i++) {
+		cb(mps->source, sources[i], param);
+		obs_source_release(sources[i]);
+	}
 }
 
 static uint32_t mps_width(void *data)
 {
 	struct media_playlist_source *mps = data;
-	return obs_source_get_width(mps->current_media_source);
+	obs_source_t *source = get_active_source_ref(mps);
+	uint32_t width = source ? obs_source_get_width(source) : 0;
+	if (source)
+		obs_source_release(source);
+	return width;
 }
 
 static uint32_t mps_height(void *data)
 {
 	struct media_playlist_source *mps = data;
-	return obs_source_get_height(mps->current_media_source);
+	obs_source_t *source = get_active_source_ref(mps);
+	uint32_t height = source ? obs_source_get_height(source) : 0;
+	if (source)
+		obs_source_release(source);
+	return height;
 }
 
 static void mps_defaults(obs_data_t *settings)
@@ -1173,6 +2304,7 @@ static void mps_update(void *data, obs_data_t *settings)
 	enum visibility_behavior visibility_behavior = mps->visibility_behavior;
 	bool visibility_behavior_changed = false;
 	bool item_edited = false;
+	bool transition_pending;
 	bool restart_on_activate = true;
 	const char *old_media_path = NULL;
 	long long new_speed;
@@ -1182,6 +2314,10 @@ static void mps_update(void *data, obs_data_t *settings)
 	/* get settings data */
 
 	da_init(new_files);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->resetting = true;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	transition_pending = cancel_pending_transition(mps, true, false);
 
 	mps->visibility_behavior = obs_data_get_int(settings, S_VISIBILITY_BEHAVIOR);
 	if (mps->visibility_behavior != visibility_behavior) {
@@ -1194,9 +2330,6 @@ static void mps_update(void *data, obs_data_t *settings)
 	mps->loop = obs_data_get_bool(settings, S_LOOP);
 	shuffler_set_loop(&mps->shuffler, mps->loop);
 	new_speed = obs_data_get_int(settings, S_SPEED);
-	if (mps->speed != new_speed) {
-		mps->user_stopped = true;
-	}
 	mps->speed = new_speed;
 
 	/* Internal media source settings */
@@ -1206,13 +2339,22 @@ static void mps_update(void *data, obs_data_t *settings)
 	    mps->visibility_behavior == VISIBILITY_BEHAVIOR_PAUSE_UNPAUSE) {
 		restart_on_activate = false;
 	}
-	obs_data_t *media_source_settings = obs_data_create();
-	obs_data_set_bool(media_source_settings, S_FFMPEG_RESTART_ON_ACTIVATE, restart_on_activate);
-	obs_data_set_bool(media_source_settings, S_FFMPEG_HW_DECODE, mps->use_hw_decoding);
-	obs_data_set_bool(media_source_settings, S_FFMPEG_CLOSE_WHEN_INACTIVE, mps->close_when_inactive);
-	obs_data_set_int(media_source_settings, S_SPEED, mps->speed);
-	obs_source_update(mps->current_media_source, media_source_settings);
-	obs_data_release(media_source_settings);
+	for (size_t i = 0; i < 2; i++) {
+		bool active;
+		obs_source_t *media_source = get_slot_source_ref_and_active(mps, &mps->media_slots[i], &active);
+		if (!media_source)
+			continue;
+
+		obs_data_t *media_source_settings = obs_data_create();
+		obs_data_set_bool(media_source_settings, S_FFMPEG_RESTART_ON_ACTIVATE, restart_on_activate);
+		obs_data_set_bool(media_source_settings, S_FFMPEG_HW_DECODE, mps->use_hw_decoding);
+		obs_data_set_bool(media_source_settings, S_FFMPEG_CLOSE_WHEN_INACTIVE,
+				  active && mps->close_when_inactive);
+		obs_data_set_int(media_source_settings, S_SPEED, mps->speed);
+		obs_source_update(media_source, media_source_settings);
+		obs_data_release(media_source_settings);
+		obs_source_release(media_source);
+	}
 	mps->state = obs_source_media_get_state(mps->source);
 	if (visibility_behavior_changed && !obs_source_active(mps->source) &&
 	    (mps->state == OBS_MEDIA_STATE_PLAYING || mps->state == OBS_MEDIA_STATE_PAUSED)) {
@@ -1268,15 +2410,21 @@ static void mps_update(void *data, obs_data_t *settings)
 	}
 	old_files.da = mps->files.da;
 	mps->files.da = new_files.da;
-	pthread_mutex_unlock(&mps->mutex);
-
 	free_files(&old_files.da);
-
 	if (found || mps->first_update) {
 		set_current_media_index(mps, mps->current_media_index);
 	} else {
 		set_current_media_index(mps, 0);
 	}
+	if (mps->current_media && mps->current_media->is_folder)
+		mps->actual_media = NULL;
+	else
+		mps->actual_media = mps->current_media;
+	pthread_mutex_unlock(&mps->mutex);
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->prefetch_dirty = true;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 
 	if (get_total_file_count(mps)) {
 		if (item_edited) {
@@ -1308,12 +2456,13 @@ static void mps_update(void *data, obs_data_t *settings)
 				shuffler_select(&mps->shuffler, mps->actual_media);
 		}
 
-		if (mps->first_update || !found || item_edited) {
+		if (mps->first_update || !found || item_edited || transition_pending) {
 			/* Clear if last file is a folder and is empty */
 			if (mps->current_media->is_folder && mps->current_media->folder_items.num == 0) {
 				clear_media_source(mps);
 			} else {
 				update_media_source(mps, true);
+				request_media_switch(mps, MPS_SWITCH_NEXT, false);
 			}
 		}
 	} else if (!mps->first_update) {
@@ -1321,6 +2470,7 @@ static void mps_update(void *data, obs_data_t *settings)
 		mps->current_media_filename = NULL;
 		clear_media_source(mps);
 	}
+	rebind_active_slot_metadata(mps);
 	obs_source_save(mps->source);
 
 	/* So Current File Name is updated */
@@ -1339,6 +2489,9 @@ static void mps_update(void *data, obs_data_t *settings)
 	//}
 	obs_data_array_release(array);
 	mps->first_update = false;
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->resetting = false;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 }
 
 static void mps_save(void *data, obs_data_t *settings)
