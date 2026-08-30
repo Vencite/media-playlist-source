@@ -4,6 +4,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCO
 
 project(${_name} VERSION ${_version})
 
+include(CTest)
+
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
 option(ENABLE_QT "Use Qt functionality" OFF)
 
@@ -39,6 +41,8 @@ target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE src/plugin-main.c
           src/playlist.h
+          src/playback-coordinator.h
+          src/playback-coordinator.c
           src/media-playlist-source.h
           src/media-playlist-source.c
           src/shuffler.h
@@ -46,3 +50,9 @@ target_sources(
 # cmake-format: on
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+if(BUILD_TESTING)
+  add_executable(playback-coordinator-test tests/playback-coordinator-test.c src/playback-coordinator.c)
+  target_include_directories(playback-coordinator-test PRIVATE src)
+  add_test(NAME playback-coordinator COMMAND playback-coordinator-test)
+endif()
