@@ -1,5 +1,36 @@
 # Media Playlist Source
 
+[![Latest release](https://img.shields.io/github/v/release/Vencite/media-playlist-source?include_prereleases=true&label=latest%20release)](https://github.com/Vencite/media-playlist-source/releases)
+[![Upstream](https://img.shields.io/badge/upstream-CodeYan01%2Fmedia--playlist--source-181717?logo=github&logoColor=white)](https://github.com/CodeYan01/media-playlist-source)
+[![OBS Studio](https://img.shields.io/badge/OBS%20Studio-tested%20on%20OBS%2032-302E31?logo=obsstudio&logoColor=white)](https://obsproject.com/)
+[![License](https://img.shields.io/github/license/Vencite/media-playlist-source?label=license)](https://github.com/Vencite/media-playlist-source/blob/master/LICENSE)
+
+## About this fork
+
+This repository is a personal fork of [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source). The original plugin and the majority of its code were created by Ian Rodriguez / CodeYan01.
+
+This fork started from a practical production problem: while using the plugin in OBS, I found a short transparent or blank frame between consecutive playlist files. Because I have other sources below the playlist in my scene, that single frame was visible on the live broadcast. I wanted playback behavior that was closer to seamless playback.
+
+The first major change in this fork is dual-source A/B playback with preloading of the next item. The fix has also been submitted to the upstream project as [CodeYan01/media-playlist-source#60](https://github.com/CodeYan01/media-playlist-source/pull/60).
+
+I intend to use this fork in my own production environment and continue improving it when that remains useful.
+
+In practical terms, a fair amount of this fork is "vibe coded" with AI assistance. I am not a full-time OBS plugin developer, so AI coding tools help me understand and modify the codebase. I still try to treat production reliability seriously: changes are reviewed, compiled, tested in CI, and validated in OBS before I rely on them during live production.
+
+The upstream repository remains the right place for the original project. If you want the original upstream version, please use [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source). This fork may contain experimental or additional changes.
+
+## Fork-specific changes
+
+### 0.1.3-ven.1
+
+- Seamless dual-source A/B playback ([upstream PR #60](https://github.com/CodeYan01/media-playlist-source/pull/60)).
+- Preloads the next local video before switching.
+- Prevents blank or transparent frames between playlist items.
+- Fixes startup/bootstrap behavior when OBS starts on another scene.
+- Fixes hidden standby source activation and enumeration.
+- OBS 32 compatibility and build updates.
+- Additional playback coordinator tests and a manual regression checklist.
+
 ## Introduction
 
 An OBS Plugin that serves as an alternative to VLC Video Source. It uses the
@@ -63,13 +94,12 @@ If `media_index` is higher than the playlist item count, it will be set to 0.
 If `folder_item_index` is higher than the folder item count or `media_index`,
 it will be set to 0.
 
-## Contact Me
-Although there is a Discussion tab in these forums, I would see your message
-faster if you ping me (@codeyan) in the [OBS Discord server](https://discord.gg/obsproject),
-in #plugins-and-tools. Please do report bugs or if there are features you'd like
-to be added.
+## Upstream author
 
-## Donations
-You can	donate to me through 
-[PayPal](https://www.paypal.com/donate/?hosted_button_id=S9WJDUDB8CK5S)
-to support my development. Thank you!
+The original plugin was created by Ian Rodriguez / CodeYan01. For questions,
+bug reports, or feature requests concerning the original project, please
+contact the upstream author by mentioning @codeyan in the
+[OBS Discord server](https://discord.gg/obsproject), in #plugins-and-tools.
+
+Support for the upstream author's development can be provided through the
+original author's [PayPal donation page](https://www.paypal.com/donate/?hosted_button_id=S9WJDUDB8CK5S).
