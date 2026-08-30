@@ -53,12 +53,16 @@ struct media_source_slot {
 	struct media_source_callback_context *callback_context;
 	obs_source_t *source;
 	char *path;
+	char *media_id;
+	char *folder_item_filename;
 	uint64_t source_generation;
 	uint64_t request_generation;
 	size_t media_index;
 	size_t folder_item_index;
 	bool folder_item;
+	bool is_url;
 	bool local_video;
+	bool manual_showing;
 	bool failed;
 	bool ended;
 	bool ended_handled;

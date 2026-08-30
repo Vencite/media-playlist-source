@@ -259,14 +259,22 @@ static void destroy_media_slot(struct media_source_slot *slot)
 	struct media_source_callback_context *callback_context;
 	obs_source_t *source;
 	char *path;
+	char *media_id;
+	char *folder_item_filename;
+	bool manual_showing;
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	source = slot->source;
 	callback_context = slot->callback_context;
 	path = slot->path;
+	media_id = slot->media_id;
+	folder_item_filename = slot->folder_item_filename;
+	manual_showing = slot->manual_showing;
 	slot->source = NULL;
 	slot->callback_context = NULL;
 	slot->path = NULL;
+	slot->media_id = NULL;
+	slot->folder_item_filename = NULL;
 	slot->request_generation = 0;
 	slot->failed = false;
 	slot->ended = false;
@@ -274,17 +282,23 @@ static void destroy_media_slot(struct media_source_slot *slot)
 	slot->expected_stop = true;
 	slot->produced_output = false;
 	slot->audio_enabled = false;
+	slot->is_url = false;
+	slot->manual_showing = false;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
 
 	if (source) {
 		obs_source_remove_audio_capture_callback(source, mps_audio_callback, callback_context);
 		signal_handler_disconnect(obs_source_get_signal_handler(source), "media_ended", media_source_ended,
 					  callback_context);
+		if (manual_showing)
+			obs_source_dec_showing(source);
 		obs_source_release(source);
 	}
 	bfree(callback_context);
 
 	bfree(path);
+	bfree(media_id);
+	bfree(folder_item_filename);
 }
 
 static bool cancel_pending_transition(struct media_playlist_source *mps, bool discard_prefetch)
@@ -326,6 +340,79 @@ static void restore_active_playlist_position(struct media_playlist_source *mps)
 	set_current_media_index(mps, media_index);
 	set_current_folder_item_index(mps, folder_item ? folder_item_index : 0);
 	pthread_mutex_unlock(&mps->mutex);
+}
+
+static void rebind_active_slot_metadata(struct media_playlist_source *mps)
+{
+	struct media_source_slot *slot;
+	char *media_id = NULL;
+	char *folder_item_filename = NULL;
+	char *path = NULL;
+	uint64_t source_generation = 0;
+	size_t media_index = 0;
+	size_t folder_item_index = 0;
+	bool folder_item = false;
+	bool is_url = false;
+	bool found = false;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	slot = mps->active_slot;
+	if (slot && slot->source && slot->media_id && slot->path) {
+		media_id = bstrdup(slot->media_id);
+		if (slot->folder_item_filename)
+			folder_item_filename = bstrdup(slot->folder_item_filename);
+		path = bstrdup(slot->path);
+		source_generation = slot->source_generation;
+		folder_item = slot->folder_item;
+		is_url = slot->is_url;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (!media_id || !path)
+		goto cleanup;
+
+	pthread_mutex_lock(&mps->mutex);
+	for (size_t i = 0; i < mps->files.num; i++) {
+		struct media_file_data *media = &mps->files.array[i];
+		if (strcmp(media->id, media_id) != 0)
+			continue;
+		if (!folder_item) {
+			if (!media->is_folder && media->is_url == is_url && strcmp(media->path, path) == 0) {
+				media_index = i;
+				folder_item_index = 0;
+				found = true;
+			}
+			break;
+		}
+		if (!media->is_folder || !folder_item_filename)
+			break;
+		for (size_t j = 0; j < media->folder_items.num; j++) {
+			struct media_file_data *item = &media->folder_items.array[j];
+			if (item->is_url == is_url && strcmp(item->filename, folder_item_filename) == 0 &&
+			    strcmp(item->path, path) == 0) {
+				media_index = i;
+				folder_item_index = j;
+				found = true;
+				break;
+			}
+		}
+		break;
+	}
+	pthread_mutex_unlock(&mps->mutex);
+
+	if (found) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		if (mps->active_slot == slot && slot->source && slot->source_generation == source_generation) {
+			slot->media_index = media_index;
+			slot->folder_item_index = folder_item_index;
+			slot->folder_item = folder_item;
+		}
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+	}
+
+cleanup:
+	bfree(media_id);
+	bfree(folder_item_filename);
+	bfree(path);
 }
 
 static obs_data_t *create_media_settings(struct media_playlist_source *mps, const struct media_file_data *media,
@@ -398,6 +485,7 @@ static bool create_media_slot(struct media_playlist_source *mps, struct media_so
 		slot->path = path;
 		slot->source_generation = source_generation;
 		slot->request_generation = request_generation;
+		slot->is_url = media->is_url;
 		slot->local_video = local_video;
 		slot->failed = callback_context->ended_before_publish;
 		slot->ended = false;
@@ -1421,10 +1509,13 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 	obs_source_t *new_source = get_slot_source_ref(mps, slot);
 	obs_source_t *old_source = get_active_source_ref(mps);
 	struct media_source_slot *old_slot;
+	char *media_id = NULL;
+	char *folder_item_filename = NULL;
 	size_t media_index;
 	size_t folder_item_index;
 	bool folder_item;
 	bool child_added = false;
+	bool manual_showing = false;
 	bool valid;
 
 	if (!new_source) {
@@ -1436,6 +1527,10 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 	media_index = mps->current_media_index;
 	folder_item_index = mps->current_folder_item_index;
 	folder_item = mps->current_media && mps->current_media->is_folder;
+	if (mps->current_media)
+		media_id = bstrdup(mps->current_media->id);
+	if (folder_item && mps->actual_media)
+		folder_item_filename = bstrdup(mps->actual_media->filename);
 	pthread_mutex_unlock(&mps->mutex);
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	valid = slot->source == new_source && mps_coordinator_matches(&mps->coordinator, request_generation);
@@ -1444,28 +1539,42 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 		obs_source_release(new_source);
 		if (old_source)
 			obs_source_release(old_source);
+		bfree(media_id);
+		bfree(folder_item_filename);
 		return false;
 	}
 
 	if (slot->local_video) {
 		obs_source_add_active_child(mps->source, new_source);
 		child_added = true;
+		if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_ALWAYS_PLAY && !obs_source_showing(mps->source)) {
+			obs_source_inc_showing(new_source);
+			manual_showing = true;
+		}
 		obs_source_show_preloaded_video(new_source);
 		if (!obs_source_get_width(new_source) || !obs_source_get_height(new_source)) {
+			if (manual_showing)
+				obs_source_dec_showing(new_source);
 			obs_source_remove_active_child(mps->source, new_source);
 			obs_source_release(new_source);
 			if (old_source)
 				obs_source_release(old_source);
+			bfree(media_id);
+			bfree(folder_item_filename);
 			return false;
 		}
 		configure_active_media_source(mps, new_source);
 		obs_source_show_preloaded_video(new_source);
 		if (!obs_source_get_width(new_source) || !obs_source_get_height(new_source)) {
+			if (manual_showing)
+				obs_source_dec_showing(new_source);
 			obs_source_remove_active_child(mps->source, new_source);
 			obs_source_release(new_source);
 			if (old_source)
 				obs_source_release(old_source);
 			destroy_media_slot(slot);
+			bfree(media_id);
+			bfree(folder_item_filename);
 			return false;
 		}
 	}
@@ -1484,6 +1593,13 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 		slot->media_index = media_index;
 		slot->folder_item_index = folder_item_index;
 		slot->folder_item = folder_item;
+		bfree(slot->media_id);
+		bfree(slot->folder_item_filename);
+		slot->media_id = media_id;
+		slot->folder_item_filename = folder_item_filename;
+		media_id = NULL;
+		folder_item_filename = NULL;
+		slot->manual_showing = manual_showing;
 		mps->active_slot = slot;
 		mps->standby_slot =
 			old_slot ? old_slot
@@ -1494,6 +1610,8 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
 
 	if (!valid) {
+		if (manual_showing)
+			obs_source_dec_showing(new_source);
 		if (child_added)
 			obs_source_remove_active_child(mps->source, new_source);
 		obs_source_release(new_source);
@@ -1501,6 +1619,8 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 			obs_source_release(old_source);
 		if (child_added)
 			destroy_media_slot(slot);
+		bfree(media_id);
+		bfree(folder_item_filename);
 		return false;
 	}
 	if (!child_added)
@@ -1511,6 +1631,8 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 		obs_source_release(old_source);
 	}
 	obs_source_release(new_source);
+	bfree(media_id);
+	bfree(folder_item_filename);
 
 	if (old_slot)
 		destroy_media_slot(old_slot);
@@ -2224,6 +2346,7 @@ static void mps_update(void *data, obs_data_t *settings)
 		mps->current_media_filename = NULL;
 		clear_media_source(mps);
 	}
+	rebind_active_slot_metadata(mps);
 	obs_source_save(mps->source);
 
 	/* So Current File Name is updated */
