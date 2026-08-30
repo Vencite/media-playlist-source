@@ -2200,7 +2200,7 @@ static obs_properties_t *mps_properties(void *data)
 	obs_property_set_long_description(p, "Due to OBS limitations, this will only update if any settings"
 					     " are changed, the selected file is played, or the Properties "
 					     "window is reopened. It will not update when the video ends.");
-	obs_properties_add_button(props, S_REFRESH_FILENAME, T_REFRESH_FILENAME, refresh_filename_clicked);
+	obs_properties_add_button2(props, S_REFRESH_FILENAME, T_REFRESH_FILENAME, refresh_filename_clicked, NULL);
 	//update_current_filename_property(mps, p);
 
 	p = obs_properties_add_list(props, S_SELECT_FILE, T_SELECT_FILE, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -2211,7 +2211,7 @@ static obs_properties_t *mps_properties(void *data)
 		}
 	}
 
-	obs_properties_add_button(props, "play_selected", "Play Selected File", play_selected_clicked);
+	obs_properties_add_button2(props, "play_selected", "Play Selected File", play_selected_clicked, NULL);
 
 	p = obs_properties_add_int_slider(props, S_SPEED, T_SPEED, 1, 200, 1);
 	obs_property_int_set_suffix(p, "%");
