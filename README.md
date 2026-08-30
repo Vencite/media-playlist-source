@@ -1,6 +1,6 @@
 # Media Playlist Source
 
-[![Latest release](https://img.shields.io/github/v/release/Vencite/media-playlist-source?include_prereleases=true&label=latest%20release)](https://github.com/Vencite/media-playlist-source/releases)
+[![Latest fork release](https://img.shields.io/github/v/release/Vencite/media-playlist-source?include_prereleases&display_name=tag&sort=date&label=latest%20fork%20release)](https://github.com/Vencite/media-playlist-source/releases)
 [![Upstream](https://img.shields.io/badge/upstream-CodeYan01%2Fmedia--playlist--source-181717?logo=github&logoColor=white)](https://github.com/CodeYan01/media-playlist-source)
 [![OBS Studio](https://img.shields.io/badge/OBS%20Studio-tested%20on%20OBS%2032-302E31?logo=obsstudio&logoColor=white)](https://obsproject.com/)
 [![License](https://img.shields.io/github/license/Vencite/media-playlist-source?label=license)](https://github.com/Vencite/media-playlist-source/blob/master/LICENSE)
