@@ -47,6 +47,15 @@ void mps_coordinator_cancel(struct mps_playback_coordinator *coordinator)
 	coordinator->preparing = false;
 }
 
+bool mps_coordinator_cancel_for_restart(struct mps_playback_coordinator *coordinator, bool active_source_present)
+{
+	if (!active_source_present || !coordinator->request_pending)
+		return false;
+
+	mps_coordinator_cancel(coordinator);
+	return true;
+}
+
 enum mps_switch_failure mps_coordinator_fail(struct mps_playback_coordinator *coordinator, uint64_t generation)
 {
 	if (!mps_coordinator_matches(coordinator, generation))

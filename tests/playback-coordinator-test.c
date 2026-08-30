@@ -133,6 +133,20 @@ static void test_cancel_invalidates_in_flight_generation(void)
 	CHECK(mps_coordinator_matches(&coordinator, replacement_generation));
 }
 
+static void test_restart_preserves_bootstrap_without_active_source(void)
+{
+	struct mps_playback_coordinator coordinator;
+	uint64_t bootstrap_generation;
+
+	mps_coordinator_init(&coordinator);
+	bootstrap_generation = mps_coordinator_request(&coordinator, MPS_SWITCH_NEXT, 2, false);
+	CHECK(!mps_coordinator_cancel_for_restart(&coordinator, false));
+	CHECK(coordinator.request_pending);
+	CHECK(coordinator.generation == bootstrap_generation);
+	CHECK(mps_coordinator_cancel_for_restart(&coordinator, true));
+	CHECK(!coordinator.request_pending);
+}
+
 int main(void)
 {
 	test_latest_rapid_request_wins();
@@ -142,6 +156,7 @@ int main(void)
 	test_successful_completion_resets_request_state();
 	test_retry_request_preserves_failure_count();
 	test_cancel_invalidates_in_flight_generation();
+	test_restart_preserves_bootstrap_without_active_source();
 	puts("playback coordinator tests passed");
 	return 0;
 }

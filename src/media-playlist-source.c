@@ -310,20 +310,36 @@ static void destroy_media_slot(struct media_source_slot *slot)
 	bfree(folder_item_filename);
 }
 
-static bool cancel_pending_transition(struct media_playlist_source *mps, bool discard_prefetch)
+static bool cancel_pending_transition(struct media_playlist_source *mps, bool discard_prefetch,
+				      bool require_active_source)
 {
 	struct media_source_slot *standby = NULL;
 	bool pending;
+	bool request_pending;
+	bool active_source_present = false;
+	uint64_t pending_generation = 0;
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
-	pending = mps->coordinator.request_pending;
-	if (pending)
-		mps_coordinator_cancel(&mps->coordinator);
+	request_pending = mps->coordinator.request_pending;
+	if (require_active_source) {
+		active_source_present = mps->active_slot && mps->active_slot->source;
+		pending_generation = mps->coordinator.generation;
+		pending = mps_coordinator_cancel_for_restart(&mps->coordinator, active_source_present);
+	} else {
+		pending = request_pending;
+		if (pending)
+			mps_coordinator_cancel(&mps->coordinator);
+	}
 	if (pending || discard_prefetch)
 		standby = mps->standby_slot;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
 	if (standby)
 		destroy_media_slot(standby);
+	if (require_active_source && request_pending) {
+		obs_log(LOG_DEBUG, "Restart Current: pending transition generation %llu %s; active source=%s%s",
+			(unsigned long long)pending_generation, pending ? "cancelled" : "preserved",
+			active_source_present ? "present" : "absent", active_source_present ? "" : " (bootstrap preserved)");
+	}
 	return pending;
 }
 
@@ -999,7 +1015,7 @@ static void mps_restart(void *data)
 	obs_source_t *source;
 	bool restart_current = mps->restart_behavior == RESTART_BEHAVIOR_CURRENT_FILE;
 
-	if (restart_current && cancel_pending_transition(mps, false))
+	if (restart_current && cancel_pending_transition(mps, false, true))
 		restore_active_playlist_position(mps);
 
 	if (mps->restart_behavior == RESTART_BEHAVIOR_FIRST_FILE) {
@@ -1032,7 +1048,7 @@ static void mps_stop(void *data)
 	struct media_playlist_source *mps = data;
 	obs_source_t *source;
 
-	if (cancel_pending_transition(mps, false))
+	if (cancel_pending_transition(mps, false, false))
 		restore_active_playlist_position(mps);
 	source = get_active_source_ref(mps);
 
@@ -2272,7 +2288,7 @@ static void mps_update(void *data, obs_data_t *settings)
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	mps->resetting = true;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
-	transition_pending = cancel_pending_transition(mps, true);
+	transition_pending = cancel_pending_transition(mps, true, false);
 
 	mps->visibility_behavior = obs_data_get_int(settings, S_VISIBILITY_BEHAVIOR);
 	if (mps->visibility_behavior != visibility_behavior) {

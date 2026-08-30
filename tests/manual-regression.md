@@ -20,6 +20,17 @@ Expected: playback has advanced into the expected position of `B` or `C`; it is 
 
 At the `A -> B` boundary, `B` must begin actual playback while the source is hidden (rather than only displaying its preloaded first frame). Showing the parent again must not be required to start `B`.
 
+## Bootstrap and restart lifecycle
+
+Use a saved local-video playlist with at least `A` and `B`:
+
+1. Start OBS while the playlist scene is current. The first file must start without pressing **Next**.
+2. Start OBS on another scene, then switch to the playlist scene. The first file must start without pressing **Next**.
+3. After playback is initialized, leave the playlist scene and return. Existing playback behavior must be preserved.
+4. With `A` active, request **Next** to `B`, then use **Restart Current** before `B` is activated. `B` must be cancelled; `A` remains current and restarts.
+5. Check **Stop/Restart**, **Pause/Unpause**, **Always Play**, and **Stop/Play Next** independently during activation and scene visibility changes. None may create duplicate audio or duplicate decoders.
+6. Let `A` end naturally. The normal `A -> B` transition must remain seamless.
+
 ## Local-video decoder start lifecycle
 
 Use a local-video playlist `A -> B` and verify each behavior independently:
