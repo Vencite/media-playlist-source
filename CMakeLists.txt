@@ -39,14 +39,16 @@ endif()
 # cmake-format: off
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.c
-          src/playlist.h
-          src/playback-coordinator.h
-          src/playback-coordinator.c
-          src/media-playlist-source.h
-          src/media-playlist-source.c
-          src/shuffler.h
-          src/shuffler.c)
+  PRIVATE
+    src/plugin-main.c
+    src/playlist.h
+    src/playback-coordinator.h
+    src/playback-coordinator.c
+    src/media-playlist-source.h
+    src/media-playlist-source.c
+    src/shuffler.h
+    src/shuffler.c
+)
 # cmake-format: on
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
