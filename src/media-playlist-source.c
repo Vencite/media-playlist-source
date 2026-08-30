@@ -338,7 +338,8 @@ static bool cancel_pending_transition(struct media_playlist_source *mps, bool di
 	if (require_active_source && request_pending) {
 		obs_log(LOG_DEBUG, "Restart Current: pending transition generation %llu %s; active source=%s%s",
 			(unsigned long long)pending_generation, pending ? "cancelled" : "preserved",
-			active_source_present ? "present" : "absent", active_source_present ? "" : " (bootstrap preserved)");
+			active_source_present ? "present" : "absent",
+			active_source_present ? "" : " (bootstrap preserved)");
 	}
 	return pending;
 }
