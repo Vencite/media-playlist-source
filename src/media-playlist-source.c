@@ -1550,6 +1550,8 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 		if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_ALWAYS_PLAY && !obs_source_showing(mps->source)) {
 			obs_source_inc_showing(new_source);
 			manual_showing = true;
+			/* AUX showing does not activate ffmpeg_source, so start it explicitly. */
+			obs_source_media_restart(new_source);
 		}
 		obs_source_show_preloaded_video(new_source);
 		if (!obs_source_get_width(new_source) || !obs_source_get_height(new_source)) {
