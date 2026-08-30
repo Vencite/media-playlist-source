@@ -9,10 +9,17 @@ on:
         type: choice
         options:
           - build
+      package:
+        description: Build installation packages
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: write
 jobs:
   check-and-build:
     if: inputs.job == 'build'
     uses: ./.github/workflows/build-project.yaml
+    with:
+      package: ${{ inputs.package }}
     secrets: inherit

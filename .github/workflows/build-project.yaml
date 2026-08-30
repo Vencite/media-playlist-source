@@ -1,6 +1,12 @@
 name: Build Project
 on:
   workflow_call:
+    inputs:
+      package:
+        description: Build installation packages
+        required: false
+        type: boolean
+        default: false
     outputs:
       pluginName:
         description: Project name detected by parsing build spec file
@@ -48,7 +54,7 @@ jobs:
               fi
               ;;
             workflow_dispatch)
-              config_data=('codesign:false' 'notarize:false' 'package:false' 'config:RelWithDebInfo')
+              config_data=('codesign:false' 'notarize:false' 'package:${{ inputs.package }}' 'config:RelWithDebInfo')
               ;;
             schedule)
               config_data=('codesign:false' 'notarize:false' 'package:true' 'config:RelWithDebInfo')
