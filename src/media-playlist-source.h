@@ -62,7 +62,10 @@ struct media_source_slot {
 	bool folder_item;
 	bool is_url;
 	bool local_video;
+	bool child_added;
 	bool manual_showing;
+	bool start_requested;
+	bool started;
 	bool failed;
 	bool ended;
 	bool ended_handled;
@@ -150,6 +153,7 @@ static enum obs_media_state mps_get_state(void *data);
 static void mps_end_reached(void *data);
 
 static void media_source_ended(void *data, calldata_t *cd);
+static void media_source_started(void *data, calldata_t *cd);
 void mps_audio_callback(void *data, obs_source_t *source, const struct audio_data *audio_data, bool muted);
 static bool play_selected_clicked(obs_properties_t *props, obs_property_t *property, void *data);
 
