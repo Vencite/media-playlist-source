@@ -485,6 +485,8 @@ static bool create_media_slot(struct media_playlist_source *mps, struct media_so
 	obs_data_release(settings);
 	if (!source)
 		return false;
+	/* The private source is a decoder; its audio is re-emitted by the parent. */
+	obs_source_set_muted(source, true);
 	callback_context = bzalloc(sizeof(*callback_context));
 	path = bstrdup(media->path);
 	callback_context->slot = slot;
