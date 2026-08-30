@@ -7,34 +7,36 @@
 
 ## About this fork
 
-This repository is a personal fork of [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source). The original plugin and the majority of its code were created by Ian Rodriguez / CodeYan01.
+This repository is an independently maintained fork of
+[CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source).
+The original plugin and most of its original code were created by Ian Rodriguez /
+CodeYan01; this fork is maintained and developed by Vencite.
 
-This fork started from a practical production problem: while using the plugin in OBS, I found a short transparent or blank frame between consecutive playlist files. Because I have other sources below the playlist in my scene, that single frame was visible on the live broadcast. I wanted playback behavior that was closer to seamless playback.
+The fork began with a practical production problem: while using the plugin in
+OBS, I found a short transparent or blank frame between consecutive playlist
+files. Because other sources were below the playlist in my scene, that single
+frame was visible on the live broadcast. I wanted playback behavior that was
+closer to seamless playback, which led to the dual-source A/B playback and
+preloading used here.
 
-The first major change in this fork is dual-source A/B playback with preloading of the next item. The fix has also been submitted to the upstream project as [CodeYan01/media-playlist-source#60](https://github.com/CodeYan01/media-playlist-source/pull/60).
+I use this fork in my own production environment and intend to continue
+maintaining and developing it independently as long as it remains useful.
 
-I intend to use this fork in my own production environment and continue improving it when that remains useful.
+A fair amount of this fork is developed with AI-assisted coding tools. I am not
+a full-time OBS plugin developer, so these tools help me understand and modify
+the codebase. I still treat production reliability seriously: changes are
+reviewed, compiled, tested in CI, and validated in OBS before I rely on them
+during live production.
 
-In practical terms, a fair amount of this fork is "vibe coded" with AI assistance. I am not a full-time OBS plugin developer, so AI coding tools help me understand and modify the codebase. I still try to treat production reliability seriously: changes are reviewed, compiled, tested in CI, and validated in OBS before I rely on them during live production.
+The upstream repository remains the home of the original project. If you want
+the upstream version, use
+[CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source).
 
-The upstream repository remains the right place for the original project. If you want the original upstream version, please use [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source). This fork may contain experimental or additional changes.
+## What it is
 
-## Fork-specific changes
-
-### 0.1.3-ven.1
-
-- Seamless dual-source A/B playback ([upstream PR #60](https://github.com/CodeYan01/media-playlist-source/pull/60)).
-- Preloads the next local video before switching.
-- Prevents blank or transparent frames between playlist items.
-- Fixes startup/bootstrap behavior when OBS starts on another scene.
-- Fixes hidden standby source activation and enumeration.
-- OBS 32 compatibility and build updates.
-- Additional playback coordinator tests and a manual regression checklist.
-
-## Introduction
-
-An OBS Plugin that serves as an alternative to VLC Video Source. It uses the
-Media Source internally.
+Media Playlist Source is an OBS input source that serves as an alternative to
+VLC Video Source. It uses Media Source internally and can play a playlist of
+local files, folders, and URLs supported by FFmpeg.
 
 ## Features
 
@@ -43,16 +45,17 @@ reordered.
 - Allows editing any setting without restarting the video.
 - Saves the currently playing file so it would be played when OBS restarts.
 - Allows selecting a file or folder item from the list to play.
-- Shuffling (Based on VLC 4's implementation)
-- - Allows adding/removing items from the playlist without the need to
+- Shuffling based on VLC 4's implementation:
+  - Allows adding/removing items from the playlist without the need to
 reshuffle. The shuffling order of already played items will be saved, so
 clicking Previous Item will still play the previous item. Selecting a file or
 folder item also does not break the history.
-- - Reshuffles when the last file in the playlist is played out, without
+  - Reshuffles when the last file in the playlist is played out, without
 affecting history.
 - Shows the filename of the current file in the Properties window.
 - Has an option to play the first file or the current file when the source is
 restarted.
+- Preloads the next local video to support seamless A/B playlist switching.
 
 ## Limitations
 
@@ -60,15 +63,19 @@ restarted.
 not be automatically updated when the video ends as it could cause OBS to crash
 when the video ends while interacting with the Properties window. Reopening the
 Properties window will refresh the shown current file.
-- While this plugin works with OBS 28 and up, it requires this change at 
-https://github.com/obsproject/obs-studio/pull/8051 that allows this plugin to
-save the index of the current file, so that restarting playback is not needed
-when editing the list. This change isn't merged yet as of OBS 29.1.3.
-A custom build with this PR is available
-[here](https://github.com/CodeYan01/obs-studio/releases).
+- Preserving the current item when editable-list entries are edited or
+reordered depends on OBS preserving the custom UUID fields used by this plugin;
+see [OBS PR #8051](https://github.com/obsproject/obs-studio/pull/8051).
 - Does not support audio track or subtitle selection yet.
 - Does not automatically refresh folder contents yet, but can be manually done
 by saving the settings again.
+
+## Releases
+
+Download current Vencite fork builds from the
+[GitHub Releases page](https://github.com/Vencite/media-playlist-source/releases).
+Stable fork releases use the `vMAJOR.MINOR.PATCH-ven` tag convention; fork
+prereleases append a numeric suffix, such as `vMAJOR.MINOR.PATCH-ven.1`.
 
 ## For Developers
 To find out the keys used in the source [settings](https://docs.obsproject.com/reference-sources#c.obs_source_get_settings),
