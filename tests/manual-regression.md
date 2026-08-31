@@ -28,6 +28,28 @@ Expected: there is no full-volume burst during either transition, and the
 parent gain remains effective for the entire transition. With the parent muted,
 the output remains silent throughout. Monitoring and encoded output must agree.
 
+## Playlist status dock lifecycle
+
+With the plugin built with the frontend and Qt options enabled:
+
+1. Open OBS's **Docks** menu and enable **Media Playlist**.
+2. Create two Media Playlist Source instances with different names and
+   playlists; confirm both appear in the selector.
+3. Select each source and verify its previous, current, and next actual media
+   filenames, including a folder playlist entry.
+4. Rename the selected source and confirm the selector label updates while the
+   selected UUID and playback context remain unchanged.
+5. Use sequential and shuffle playback, with loop both enabled and disabled;
+   press **Next**, **Previous**, manually select an item, restart, stop, and
+   activate/deactivate the source.
+6. Remove the selected source from the scene collection, then destroy it and
+   create another Media Playlist Source.
+
+Expected: the dock follows only the selected source, displays the same logical
+next item that playback will use, does not change shuffle order merely by
+refreshing, and clears its selector and three values when the selected source
+is removed or destroyed. No crash or stale OBS source pointer is observed.
+
 ## Playlist lifecycle regression matrix
 
 Use a local-video playlist with audio containing `A`, `B`, and `C`, and run the

@@ -76,6 +76,7 @@ struct media_source_slot {
 
 struct media_playlist_source {
 	obs_source_t *source;
+	char *source_uuid;
 	struct media_source_slot media_slots[2];
 	struct media_source_slot *active_slot;
 	struct media_source_slot *standby_slot;
@@ -99,6 +100,7 @@ struct media_playlist_source {
 	DARRAY(struct media_file_data) files;
 	struct media_file_data *current_media; // only for file/folder in the list
 	struct media_file_data *actual_media;  // for both files and folder items
+	char *logical_next_path;               // copied target resolved by playback/prefetch
 	size_t current_media_index;
 	char *current_media_filename; // only used with folder_items
 	// to know if current_folder_item_index will be used, check if current file is a folder
