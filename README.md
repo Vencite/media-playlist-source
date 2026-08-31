@@ -5,111 +5,81 @@
 [![OBS Studio](https://img.shields.io/badge/OBS%20Studio-tested%20on%20OBS%2032-302E31?logo=obsstudio&logoColor=white)](https://obsproject.com/)
 [![License](https://img.shields.io/github/license/Vencite/media-playlist-source?label=license)](https://github.com/Vencite/media-playlist-source/blob/master/LICENSE)
 
+An enhanced and actively maintained OBS Studio plugin for media playlists, built on OBS Media Source. It provides playlist behavior similar to VLC Video Source while keeping playback inside OBS Media Source.
+
 ## About this fork
 
-This repository is an independently maintained fork of
-[CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source).
-The original plugin and most of its original code were created by Ian Rodriguez /
-CodeYan01; this fork is maintained and developed by Vencite.
+This repository is an independently maintained fork of [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source). The original plugin and most of its original code were created by Ian Rodriguez / CodeYan01; this fork is maintained and developed by Vencite.
 
-The fork began with a practical production problem: while using the plugin in
-OBS, I found a short transparent or blank frame between consecutive playlist
-files. Because other sources were below the playlist in my scene, that single
-frame was visible on the live broadcast. I wanted playback behavior that was
-closer to seamless playback, which led to the dual-source A/B playback and
-preloading used here.
+The fork started from a production issue where the playlist source could briefly become transparent between consecutive files, exposing sources underneath it during a live broadcast. The fork now uses dual-source A/B playback with preloading for local video files to make consecutive playback effectively seamless.
 
-I use this fork in my own production environment and intend to continue
-maintaining and developing it independently as long as it remains useful.
+It also includes fixes developed independently from upstream, including corrected audio routing for the internal playlist decoders so the parent Media Playlist Source remains authoritative for mixer gain, mute, filters, and track routing.
 
-In practical terms, a fair amount of this fork is "vibe coded" with AI
-assistance. I am not a full-time OBS plugin developer, so AI coding tools help
-me understand and modify the codebase. I still treat production reliability
-seriously: changes are reviewed, compiled, tested in CI, and validated in OBS
-before I rely on them during live production.
-
-The upstream repository remains the home of the original project. If you want
-the upstream version, use
-[CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source).
-For fork-specific bug reports and feature requests, use the
-[Vencite repository](https://github.com/Vencite/media-playlist-source/issues).
-
-## What it is
-
-Media Playlist Source is an OBS input source that serves as an alternative to
-VLC Video Source. It uses Media Source internally and can play a playlist of
-local files, folders, and URLs supported by FFmpeg.
+The upstream repository remains the home of the original project. For the upstream version, use [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source). For bugs or feature requests affecting this fork, use the [Vencite issue tracker](https://github.com/Vencite/media-playlist-source/issues).
 
 ## Features
 
-- Allows editing the playlist without restarting the video, even if files are
-reordered.
-- Allows editing any setting without restarting the video.
-- Saves the currently playing file so it would be played when OBS restarts.
-- Allows selecting a file or folder item from the list to play.
-- Shuffling based on VLC 4's implementation:
-  - Allows adding/removing items from the playlist without the need to
-reshuffle. The shuffling order of already played items will be saved, so
-clicking Previous Item will still play the previous item. Selecting a file or
-folder item also does not break the history.
-  - Reshuffles when the last file in the playlist is played out, without
-affecting history.
+- Plays playlists of local files, folders, and URLs supported by FFmpeg.
+- Allows editing the playlist without restarting playback, including reordering items.
+- Allows editing source settings without restarting the current video.
+- Saves the currently playing file so it can be resumed when OBS restarts.
+- Allows selecting a file or folder item directly from the playlist.
+- Uses VLC 4-style shuffle behavior:
+  - Items can be added or removed without reshuffling the already established history.
+  - Previously played items remain available through Previous Item.
+  - Selecting a file or folder item does not break shuffle history.
+  - The playlist reshuffles after the last file is played without discarding history.
 - Shows the filename of the current file in the Properties window.
-- Has an option to play the first file or the current file when the source is
-restarted.
-- Preloads the next local video to support seamless A/B playlist switching.
+- Can start with either the first file or the previously current file when the source is restarted.
+- Preloads the next local video and switches between internal A/B decoders to avoid the blank or transparent frame that can otherwise appear between consecutive files.
+- Routes decoder audio through the parent Media Playlist Source so its mixer gain, mute state, filters, and OBS track routing remain authoritative.
+
+## Installation
+
+Download the latest Vencite build from the [GitHub Releases page](https://github.com/Vencite/media-playlist-source/releases).
+
+Current releases provide builds for:
+
+- Windows x64: installer and portable packages.
+- macOS: universal package for Apple Silicon and Intel Macs.
+- Linux x86_64: Debian package.
+
+The current build configuration targets OBS Studio 31.1.1 and the fork is tested on OBS Studio 32.
 
 ## Limitations
 
-- The Properties window will show the filename of the current file, but it can
-not be automatically updated when the video ends as it could cause OBS to crash
-when the video ends while interacting with the Properties window. Reopening the
-Properties window will refresh the shown current file.
-- Programmatic playlist updates must preserve or provide each entry's `uuid`.
-OBS generates and preserves those IDs for editable-list changes made in the
-Properties UI; the plugin uses them to keep duplicate entries and the current
-item distinct. See [OBS PR #11126](https://github.com/obsproject/obs-studio/pull/11126).
-- Does not support audio track or subtitle selection yet.
-- Does not automatically refresh folder contents yet, but can be manually done
-by saving the settings again.
+- The Properties window shows the current filename, but it cannot be updated automatically when playback advances because doing so can cause OBS to crash while the Properties window is being interacted with. Reopening Properties refreshes the displayed filename.
+- Programmatic playlist updates must preserve or provide each entry's `uuid`. OBS generates and preserves those IDs for editable-list changes made in the Properties UI; the plugin uses them to keep duplicate entries and the current item distinct. See [OBS PR #11126](https://github.com/obsproject/obs-studio/pull/11126).
+- Audio track and subtitle selection are not supported yet.
+- Folder contents are not refreshed automatically yet. Saving the source settings again refreshes them manually.
 
 ## Releases
 
-Download current Vencite fork builds from the
-[GitHub Releases page](https://github.com/Vencite/media-playlist-source/releases).
-Stable fork releases use the `vMAJOR.MINOR.PATCH-ven` tag convention; fork
-prereleases append a numeric suffix, such as `vMAJOR.MINOR.PATCH-ven.1`.
+Stable Vencite releases use the `vMAJOR.MINOR.PATCH-ven` tag convention. Fork prereleases append a numeric suffix, for example `vMAJOR.MINOR.PATCH-ven.1`.
 
-## For Developers
-To find out the keys used in the source [settings](https://docs.obsproject.com/reference-sources#c.obs_source_get_settings),
-use [obs_data_get_json](https://docs.obsproject.com/reference-settings#c.obs_data_get_json)
-to view it, or check the scene collection json. You could also check
-[src/media-playlist-source.c](src/media-playlist-source.c)
+Release-specific validation notes are kept in [`docs/release-notes`](docs/release-notes), and the manual regression checklist is available in [`tests/manual-regression.md`](tests/manual-regression.md).
+
+## For developers
+
+To inspect the keys stored in the source [settings](https://docs.obsproject.com/reference-sources#c.obs_source_get_settings), use [obs_data_get_json](https://docs.obsproject.com/reference-settings#c.obs_data_get_json) or inspect the scene collection JSON. The implementation is in [`src/media-playlist-source.c`](src/media-playlist-source.c).
 
 To select a file programmatically:
+
 ```c
 proc_handler_t *ph = obs_source_get_proc_handler(source);
 struct calldata cd = {0};
 calldata_set_int(&cd, "media_index", 3); // 4th file
-calldata_set_int(&cd, "folder_item_index", 3) // 4th folder item of the 4th file
+calldata_set_int(&cd, "folder_item_index", 3); // 4th folder item of the 4th file
 proc_handler_call(ph, "select_index", &cd);
 calldata_free(&cd);
 ```
-`media_index` - the 0-based index of the file in the playlist
 
-`folder_item_index` - the 0-based index of the folder item in the folder at `media_index`
+`media_index` is the zero-based index of the file in the playlist.
 
-If the file at `media_index` is not a folder, the second parameter is ignored.
-If `media_index` is higher than the playlist item count, it will be set to 0.
-If `folder_item_index` is higher than the folder item count or `media_index`,
-it will be set to 0.
+`folder_item_index` is the zero-based index of the folder item inside the folder at `media_index`.
 
-## Upstream author
+If the item at `media_index` is not a folder, `folder_item_index` is ignored. Out-of-range indexes are reset to `0`.
 
-The original plugin was created by Ian Rodriguez / CodeYan01. For questions,
-bug reports, or feature requests concerning the original project, please
-contact the upstream author by mentioning @codeyan in the
-[OBS Discord server](https://discord.gg/obsproject), in #plugins-and-tools.
+## Development and testing
 
-Support for the upstream author's development can be provided through the
-original author's [PayPal donation page](https://www.paypal.com/donate/?hosted_button_id=S9WJDUDB8CK5S).
+Development of this fork uses AI-assisted coding tools where useful, but changes are reviewed, compiled in CI, and validated in OBS before being relied on in production.
