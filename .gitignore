@@ -12,6 +12,22 @@
 !.gersemirc
 !.gitignore
 /AGENTS.md
+
+# Exclude agent and AI work files
+AGENT.md
+AGENTS.md
+agents.md
+CLAUDE.md
+CODEX.md
+GEMINI.md
+copilot-instructions.md
+.ai/
+.agents/
+.codemap/
+.codex/
+.cursor/
+.graphify-out/
+.windsurf/
 !buildspec.json
 !CMakeLists.txt
 !CMakePresets.json
