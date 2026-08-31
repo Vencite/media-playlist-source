@@ -128,10 +128,13 @@ void PlaylistDock::schedule_refresh()
 {
 	if (refresh_queued_.exchange(true))
 		return;
-	QMetaObject::invokeMethod(this, [this] {
-		refresh_queued_.store(false);
-		refresh_sources();
-	}, Qt::QueuedConnection);
+	QMetaObject::invokeMethod(
+		this,
+		[this] {
+			refresh_queued_.store(false);
+			refresh_sources();
+		},
+		Qt::QueuedConnection);
 }
 
 void PlaylistDock::refresh_sources()

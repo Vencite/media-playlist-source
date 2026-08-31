@@ -27,9 +27,10 @@ struct mps_playlist_context {
 };
 
 struct media_file_data *mps_next_sequential_media(struct darray *files, struct media_file_data *current_media,
-						  size_t current_media_index, size_t current_folder_item_index, bool loop);
+						  size_t current_media_index, size_t current_folder_item_index,
+						  bool loop);
 struct media_file_data *mps_previous_sequential_media(struct darray *files, struct media_file_data *current_media,
-						     size_t current_media_index, size_t current_folder_item_index, bool loop);
+						      size_t current_media_index, size_t current_folder_item_index,
+						      bool loop);
 
-void mps_playlist_context_resolve(const struct mps_playlist_context_input *input,
-					  struct mps_playlist_context *output);
+void mps_playlist_context_resolve(const struct mps_playlist_context_input *input, struct mps_playlist_context *output);

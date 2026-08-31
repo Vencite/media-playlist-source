@@ -1,3 +1,7 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -84,6 +88,7 @@ static void test_shuffle_context_does_not_peek_next(void)
 	struct mps_playlist_context output;
 	struct media_file_data *expected_previous;
 	struct media_file_data *expected_next;
+	struct media_file_data *current;
 	size_t head;
 	size_t next;
 
@@ -91,11 +96,12 @@ static void test_shuffle_context_does_not_peek_next(void)
 	shuffler_update_files(&shuffler, &files);
 	shuffler_select(&shuffler, &items[0]);
 	assert(shuffler_has_next(&shuffler));
+	current = shuffler_next(&shuffler);
 	input.files = &files;
 	input.shuffler = &shuffler;
 	input.shuffle = true;
-	input.current_media = &items[0];
-	input.actual_media = &items[0];
+	input.current_media = current;
+	input.actual_media = current;
 	expected_next = shuffler_peek_next(&shuffler);
 	input.logical_next_path = expected_next->path;
 
@@ -105,7 +111,8 @@ static void test_shuffle_context_does_not_peek_next(void)
 	expected_previous = shuffler_has_prev(&shuffler) ? shuffler_peek_prev(&shuffler) : NULL;
 	mps_playlist_context_resolve(&input, &output);
 	assert(output.previous == expected_previous);
-	assert(output.current == &items[0]);
+	assert(expected_previous == &items[0]);
+	assert(output.current == current);
 	assert(strcmp(output.next_path, expected_next->path) == 0);
 	assert(shuffler.head == head);
 	assert(shuffler.next == next);

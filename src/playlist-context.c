@@ -23,7 +23,8 @@ static struct media_file_data *last_media_in_item(struct media_file_data *media)
 }
 
 struct media_file_data *mps_next_sequential_media(struct darray *files, struct media_file_data *current_media,
-						  size_t current_media_index, size_t current_folder_item_index, bool loop)
+						  size_t current_media_index, size_t current_folder_item_index,
+						  bool loop)
 {
 	if (current_media && current_media->is_folder &&
 	    current_folder_item_index + 1 < current_media->folder_items.num)
@@ -49,7 +50,8 @@ struct media_file_data *mps_next_sequential_media(struct darray *files, struct m
 }
 
 struct media_file_data *mps_previous_sequential_media(struct darray *files, struct media_file_data *current_media,
-						     size_t current_media_index, size_t current_folder_item_index, bool loop)
+						      size_t current_media_index, size_t current_folder_item_index,
+						      bool loop)
 {
 	if (current_media && current_media->is_folder && current_folder_item_index > 0 &&
 	    current_folder_item_index <= current_media->folder_items.num)
@@ -76,8 +78,7 @@ struct media_file_data *mps_previous_sequential_media(struct darray *files, stru
 	return NULL;
 }
 
-void mps_playlist_context_resolve(const struct mps_playlist_context_input *input,
-					  struct mps_playlist_context *output)
+void mps_playlist_context_resolve(const struct mps_playlist_context_input *input, struct mps_playlist_context *output)
 {
 	if (!output)
 		return;
@@ -92,7 +93,7 @@ void mps_playlist_context_resolve(const struct mps_playlist_context_input *input
 			output->previous = shuffler_peek_prev(input->shuffler);
 	} else {
 		output->previous = mps_previous_sequential_media(input->files, input->current_media,
-								input->current_media_index,
-								input->current_folder_item_index, input->loop);
+								 input->current_media_index,
+								 input->current_folder_item_index, input->loop);
 	}
 }
