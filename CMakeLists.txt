@@ -39,17 +39,19 @@ endif()
 # cmake-format: off
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.c
-          src/playlist.h
-          src/playlist-context.h
-          src/playlist-context.c
-          src/playlist-dock.h
-          src/playback-coordinator.h
-          src/playback-coordinator.c
-          src/media-playlist-source.h
-          src/media-playlist-source.c
-          src/shuffler.h
-          src/shuffler.c)
+  PRIVATE
+    src/plugin-main.c
+    src/playlist.h
+    src/playlist-context.h
+    src/playlist-context.c
+    src/playlist-dock.h
+    src/playback-coordinator.h
+    src/playback-coordinator.c
+    src/media-playlist-source.h
+    src/media-playlist-source.c
+    src/shuffler.h
+    src/shuffler.c
+)
 # cmake-format: on
 
 if(ENABLE_FRONTEND_API AND ENABLE_QT)
