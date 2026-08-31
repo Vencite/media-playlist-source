@@ -338,7 +338,8 @@ static bool cancel_pending_transition(struct media_playlist_source *mps, bool di
 	if (require_active_source && request_pending) {
 		obs_log(LOG_DEBUG, "Restart Current: pending transition generation %llu %s; active source=%s%s",
 			(unsigned long long)pending_generation, pending ? "cancelled" : "preserved",
-			active_source_present ? "present" : "absent", active_source_present ? "" : " (bootstrap preserved)");
+			active_source_present ? "present" : "absent",
+			active_source_present ? "" : " (bootstrap preserved)");
 	}
 	return pending;
 }
@@ -485,6 +486,8 @@ static bool create_media_slot(struct media_playlist_source *mps, struct media_so
 	obs_data_release(settings);
 	if (!source)
 		return false;
+	/* The private source is a decoder; its audio is re-emitted by the parent. */
+	obs_source_set_muted(source, true);
 	callback_context = bzalloc(sizeof(*callback_context));
 	path = bstrdup(media->path);
 	callback_context->slot = slot;
