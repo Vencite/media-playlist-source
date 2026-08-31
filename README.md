@@ -22,15 +22,17 @@ preloading used here.
 I use this fork in my own production environment and intend to continue
 maintaining and developing it independently as long as it remains useful.
 
-A fair amount of this fork is developed with AI-assisted coding tools. I am not
-a full-time OBS plugin developer, so these tools help me understand and modify
-the codebase. I still treat production reliability seriously: changes are
-reviewed, compiled, tested in CI, and validated in OBS before I rely on them
-during live production.
+In practical terms, a fair amount of this fork is "vibe coded" with AI
+assistance. I am not a full-time OBS plugin developer, so AI coding tools help
+me understand and modify the codebase. I still treat production reliability
+seriously: changes are reviewed, compiled, tested in CI, and validated in OBS
+before I rely on them during live production.
 
 The upstream repository remains the home of the original project. If you want
 the upstream version, use
 [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source).
+For fork-specific bug reports and feature requests, use the
+[Vencite repository](https://github.com/Vencite/media-playlist-source/issues).
 
 ## What it is
 
@@ -63,9 +65,10 @@ restarted.
 not be automatically updated when the video ends as it could cause OBS to crash
 when the video ends while interacting with the Properties window. Reopening the
 Properties window will refresh the shown current file.
-- Preserving the current item when editable-list entries are edited or
-reordered depends on OBS preserving the custom UUID fields used by this plugin;
-see [OBS PR #8051](https://github.com/obsproject/obs-studio/pull/8051).
+- Programmatic playlist updates must preserve or provide each entry's `uuid`.
+OBS generates and preserves those IDs for editable-list changes made in the
+Properties UI; the plugin uses them to keep duplicate entries and the current
+item distinct. See [OBS PR #11126](https://github.com/obsproject/obs-studio/pull/11126).
 - Does not support audio track or subtitle selection yet.
 - Does not automatically refresh folder contents yet, but can be manually done
 by saving the settings again.

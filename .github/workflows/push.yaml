@@ -45,22 +45,26 @@ jobs:
             +([0-9]).+([0-9]).+([0-9]) )
               echo 'validTag=true' >> $GITHUB_OUTPUT
               echo 'prerelease=false' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              echo "tagName=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              echo "releaseVersion=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
               ;;
             +([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) )
               echo 'validTag=true' >> $GITHUB_OUTPUT
               echo 'prerelease=true' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              echo "tagName=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              echo "releaseVersion=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
               ;;
             v+([0-9]).+([0-9]).+([0-9])-ven )
               echo 'validTag=true' >> $GITHUB_OUTPUT
               echo 'prerelease=false' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              echo "tagName=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              echo "releaseVersion=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
               ;;
             v+([0-9]).+([0-9]).+([0-9])-ven.+([0-9]) )
               echo 'validTag=true' >> $GITHUB_OUTPUT
               echo 'prerelease=true' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              echo "tagName=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              echo "releaseVersion=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
               ;;
             *)
               echo 'validTag=false' >> $GITHUB_OUTPUT
@@ -114,6 +118,28 @@ jobs:
             echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
           done
 
+      - name: Assemble Release Notes 📝
+        if: fromJSON(steps.check.outputs.validTag)
+        id: release_body
+        run: |
+          : Assemble Release Notes 📝
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+
+          release_version="${GITHUB_REF_NAME#v}"
+          notes_path="${GITHUB_WORKSPACE}/docs/release-notes/${release_version}.md"
+          checksums_path="${GITHUB_WORKSPACE}/CHECKSUMS.txt"
+          body_path="${GITHUB_WORKSPACE}/RELEASE_BODY.md"
+
+          if [[ -f "${notes_path}" ]]; then
+            cp "${notes_path}" "${body_path}"
+            printf '\n\n' >> "${body_path}"
+            sed -n '1,$p' "${checksums_path}" >> "${body_path}"
+          else
+            cp "${checksums_path}" "${body_path}"
+          fi
+
+          echo "bodyPath=${body_path}" >> $GITHUB_OUTPUT
+
       - name: Create Release 🛫
         if: fromJSON(steps.check.outputs.validTag)
         id: create_release
@@ -121,9 +147,9 @@ jobs:
         with:
           draft: true
           prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
-          tag_name: ${{ steps.check.outputs.version }}
-          name: ${{ needs.build-project.outputs.pluginName }} ${{ steps.check.outputs.version }}
-          body_path: ${{ github.workspace }}/CHECKSUMS.txt
+          tag_name: ${{ steps.check.outputs.tagName }}
+          name: ${{ needs.build-project.outputs.pluginName }} ${{ steps.check.outputs.releaseVersion }}
+          body_path: ${{ steps.release_body.outputs.bodyPath }}
           files: |
             ${{ github.workspace }}/*.exe
             ${{ github.workspace }}/*.zip
