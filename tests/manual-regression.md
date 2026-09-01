@@ -28,27 +28,49 @@ Expected: there is no full-volume burst during either transition, and the
 parent gain remains effective for the entire transition. With the parent muted,
 the output remains silent throughout. Monitoring and encoded output must agree.
 
-## Playlist status dock lifecycle
+## Playlist Queue and Playlist Control dock lifecycle
 
 With the plugin built with the frontend and Qt options enabled:
 
-1. Open OBS's **Docks** menu and enable **Media Playlist**.
+1. Open OBS's **Docks** menu and enable **Playlist Queue** and
+   **Playlist Control**.
 2. Create two Media Playlist Source instances with different names and
-   playlists; confirm both appear in the selector.
-3. Select each source and verify its previous, current, and next actual media
-   filenames, including a folder playlist entry.
-4. Rename the selected source and confirm the selector label updates while the
-   selected UUID and playback context remain unchanged.
+   playlists; confirm both appear in each dock's selector.
+3. In **Playlist Queue**, verify the separated **Previous**, **Now Playing**,
+   and **Up Next** sections show actual filenames, including a folder child.
+   Confirm long names are elided in the dock and the full path is available in
+   the tooltip.
+4. In **Playlist Queue**, verify progress, elapsed/duration, and remaining
+   time for normal video, audio-only media, short files, and media with
+   unknown duration. Confirm the display resets to `—` when no media is active.
 5. Use sequential and shuffle playback, with loop both enabled and disabled;
    press **Next**, **Previous**, manually select an item, restart, stop, and
-   activate/deactivate the source.
-6. Remove the selected source from the scene collection, then destroy it and
-   create another Media Playlist Source.
+   activate/deactivate the source. Confirm Queue's **Up Next** is the actual
+   canonical target and opening, closing, refreshing, or timing updates do not
+   change shuffle order.
+6. In **Playlist Control**, verify standalone files and expanded folder
+   children are listed with their configured order and canonical item indices.
+   Folder rows must not be playable selections.
+7. Click a playable row and confirm that selection alone does not start media.
+   Press **Play Selected** and confirm it starts the selected standalone file or
+   folder child. Confirm the current item has the `▶`/bold indication and the
+   button is disabled with no playable selection.
+8. Switch Control between both MPS sources, enable Shuffle, and confirm the
+   list remains the configured media collection rather than being presented as
+   the future shuffle queue. Preserve a manually inspected row and scroll
+   position while playback changes.
+9. Rename the selected source and confirm each selector label updates while
+   its selected UUID and displayed state remain unchanged. Remove the selected
+   source from the scene collection, then destroy it and create another Media
+   Playlist Source.
+10. Bind Queue to MPS A and Control to MPS B. Change playback in both sources
+    and confirm notifications update only the corresponding selected state.
 
-Expected: the dock follows only the selected source, displays the same logical
-next item that playback will use, does not change shuffle order merely by
-refreshing, and clears its selector and three values when the selected source
-is removed or destroyed. No crash or stale OBS source pointer is observed.
+Expected: both independent docks follow only their own selected source, clear
+their selectors and content when that source disappears, and remain safe during
+source rename, removal, scene-collection changes, and OBS shutdown. No crash,
+stale source pointer, accidental playback on row click, or cross-contamination
+between the docks is observed.
 
 ## Playlist lifecycle regression matrix
 
