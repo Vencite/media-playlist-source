@@ -440,7 +440,7 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 
 	context_layout->addWidget(make_section_icon(QStyle::SP_MediaSkipForward, this), 8, 0);
 	context_layout->addWidget(make_section_label(tr("Up Next"), this), 8, 1);
-	next_duration_value_ = make_secondary_label(QStringLiteral("--:--"), this);
+	next_duration_value_ = make_secondary_label(QString(), this);
 	context_layout->addWidget(next_duration_value_, 8, 2);
 	next_value_ = new ElidedFileLabel(this);
 	context_layout->addWidget(next_value_, 9, 1, 1, 2);
