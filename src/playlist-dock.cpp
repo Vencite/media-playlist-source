@@ -13,6 +13,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QHideEvent>
+#include <QIcon>
 #include <QLabel>
 #include <QMetaObject>
 #include <QProgressBar>
@@ -288,7 +289,17 @@ QLabel *make_secondary_label(const QString &text, QWidget *parent = nullptr)
 {
 	auto *label = new QLabel(text, parent);
 	label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-	label->setForegroundRole(QPalette::PlaceholderText);
+	label->setForegroundRole(QPalette::Text);
+	return label;
+}
+
+QLabel *make_section_icon(QStyle::StandardPixmap icon, QWidget *parent = nullptr)
+{
+	auto *label = new QLabel(parent);
+	const int size = label->fontMetrics().height();
+	label->setPixmap(label->style()->standardIcon(icon).pixmap(size, size));
+	label->setAlignment(Qt::AlignCenter);
+	label->setFixedWidth(size + 4);
 	return label;
 }
 
@@ -367,39 +378,41 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	context_layout->setContentsMargins(0, 0, 0, 0);
 	context_layout->setHorizontalSpacing(8);
 	context_layout->setVerticalSpacing(5);
-	context_layout->setColumnStretch(0, 1);
-	context_layout->addWidget(make_section_label(tr("Previous"), this, false), 0, 0);
+	context_layout->setColumnStretch(1, 1);
+	context_layout->addWidget(make_section_icon(QStyle::SP_MediaSkipBackward, this), 0, 0);
+	context_layout->addWidget(make_section_label(tr("Previous"), this), 0, 1);
 	previous_duration_value_ = make_secondary_label(QStringLiteral("--:--"), this);
-	context_layout->addWidget(previous_duration_value_, 0, 1);
+	context_layout->addWidget(previous_duration_value_, 0, 2);
 	previous_value_ = new ElidedFileLabel(this);
-	context_layout->addWidget(previous_value_, 1, 0, 1, 2);
-	context_layout->addWidget(make_separator(this), 2, 0, 1, 2);
+	context_layout->addWidget(previous_value_, 1, 1, 1, 2);
+	context_layout->addWidget(make_separator(this), 2, 0, 1, 3);
 
-	context_layout->addWidget(make_section_label(tr("Now Playing"), this), 3, 0);
+	context_layout->addWidget(make_section_icon(QStyle::SP_MediaPlay, this), 3, 0);
+	context_layout->addWidget(make_section_label(tr("Now Playing"), this), 3, 1);
 	current_duration_value_ = make_secondary_label(QStringLiteral("--:--"), this);
-	context_layout->addWidget(current_duration_value_, 3, 1);
+	context_layout->addWidget(current_duration_value_, 3, 2);
 	current_value_ = new ElidedFileLabel(this);
 	QFont current_font = current_value_->font();
 	current_font.setBold(true);
 	current_value_->setFont(current_font);
-	context_layout->addWidget(current_value_, 4, 0, 1, 2);
+	context_layout->addWidget(current_value_, 4, 1, 1, 2);
 	progress_bar_ = new QProgressBar(this);
 	progress_bar_->setTextVisible(false);
 	progress_bar_->setRange(0, 1);
 	progress_bar_->setValue(0);
-	context_layout->addWidget(progress_bar_, 5, 0, 1, 2);
-	elapsed_value_ = new QLabel(QStringLiteral("--:--"), this);
-	elapsed_value_->setForegroundRole(QPalette::PlaceholderText);
+	context_layout->addWidget(progress_bar_, 5, 1, 1, 2);
+	elapsed_value_ = make_secondary_label(QStringLiteral("--:--"), this);
 	remaining_value_ = make_secondary_label(QStringLiteral("--:--"), this);
-	context_layout->addWidget(elapsed_value_, 6, 0);
-	context_layout->addWidget(remaining_value_, 6, 1);
-	context_layout->addWidget(make_separator(this), 7, 0, 1, 2);
+	context_layout->addWidget(elapsed_value_, 6, 1);
+	context_layout->addWidget(remaining_value_, 6, 2);
+	context_layout->addWidget(make_separator(this), 7, 0, 1, 3);
 
-	context_layout->addWidget(make_section_label(tr("Up Next"), this, false), 8, 0);
+	context_layout->addWidget(make_section_icon(QStyle::SP_MediaSkipForward, this), 8, 0);
+	context_layout->addWidget(make_section_label(tr("Up Next"), this), 8, 1);
 	next_duration_value_ = make_secondary_label(QStringLiteral("--:--"), this);
-	context_layout->addWidget(next_duration_value_, 8, 1);
+	context_layout->addWidget(next_duration_value_, 8, 2);
 	next_value_ = new ElidedFileLabel(this);
-	context_layout->addWidget(next_value_, 9, 0, 1, 2);
+	context_layout->addWidget(next_value_, 9, 1, 1, 2);
 	layout->addLayout(context_layout);
 	layout->addStretch();
 
@@ -410,10 +423,8 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 		follow_program_ = enabled;
 		follow_status_->setVisible(enabled);
 		if (enabled) {
-			if (apply_program_follow())
+			if (refresh_program_state())
 				refresh_snapshot();
-		} else {
-			set_program_scene_event_connections(program_scene_uuids_, {}, program_scene_event, this);
 		}
 	});
 
@@ -421,6 +432,8 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	progress_timer_->setInterval(kTimerIntervalMs);
 	connect(progress_timer_, &QTimer::timeout, this, &PlaylistQueueDock::refresh_progress);
 	connect(source_selector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+		if (follow_program_)
+			follow_program_action_->setChecked(false);
 		selected_source_uuid_ = index >= 0 ? source_selector_->itemData(index).toString() : QString();
 		refresh_snapshot();
 	});
@@ -514,24 +527,36 @@ void PlaylistQueueDock::schedule_playback_refresh(const char *source_uuid)
 
 void PlaylistQueueDock::schedule_program_refresh()
 {
-	if (!follow_program_ || program_refresh_queued_.exchange(true))
+	if (program_refresh_queued_.exchange(true))
 		return;
 	QMetaObject::invokeMethod(
 		this,
 		[this] {
 			program_refresh_queued_.store(false);
-			if (apply_program_follow())
+			if (refresh_program_state())
 				refresh_snapshot();
 		},
 		Qt::QueuedConnection);
 }
 
-bool PlaylistQueueDock::apply_program_follow()
+bool PlaylistQueueDock::refresh_program_state()
 {
-	if (!follow_program_)
-		return false;
 	const ProgramSourceTraversal program = enumerate_program_sources();
 	set_program_scene_event_connections(program_scene_uuids_, program.scene_uuids, program_scene_event, this);
+	const QIcon active_icon = style()->standardIcon(QStyle::SP_MediaPlay);
+	for (int index = 0; index < source_selector_->count(); index++) {
+		const bool active = program.source_uuids.contains(source_selector_->itemData(index).toString());
+		source_selector_->setItemIcon(index, active ? active_icon : QIcon());
+		QFont font = source_selector_->itemData(index, Qt::FontRole).value<QFont>();
+		if (font == QFont())
+			font = source_selector_->font();
+		font.setBold(active);
+		source_selector_->setItemData(index, font, Qt::FontRole);
+		source_selector_->setItemData(index, active ? tr("Active in Program scene") : QString(),
+					      Qt::ToolTipRole);
+	}
+	if (!follow_program_)
+		return false;
 	const QSet<QString> &active_sources = program.source_uuids;
 	follow_status_->setText(follow_status_text(static_cast<std::size_t>(active_sources.size())));
 	if (active_sources.size() != 1)
@@ -570,8 +595,7 @@ void PlaylistQueueDock::refresh_sources()
 		else
 			selected_source_uuid_.clear();
 	}
-	if (follow_program_)
-		apply_program_follow();
+	refresh_program_state();
 	refresh_snapshot();
 }
 
@@ -753,6 +777,10 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	playlist_->setUniformRowHeights(true);
 	playlist_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 	playlist_->setIndentation(16);
+	playlist_->headerItem()->setTextAlignment(0, Qt::AlignCenter);
+	playlist_->headerItem()->setTextAlignment(1, Qt::AlignCenter);
+	playlist_->headerItem()->setTextAlignment(2, Qt::AlignLeft | Qt::AlignVCenter);
+	playlist_->header()->setMinimumHeight(playlist_->header()->fontMetrics().height() + 10);
 	playlist_->header()->setStretchLastSection(false);
 	playlist_->header()->setSectionResizeMode(0, QHeaderView::Fixed);
 	playlist_->header()->setSectionResizeMode(1, QHeaderView::Fixed);
@@ -786,6 +814,8 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	});
 
 	connect(source_selector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+		if (follow_program_)
+			follow_program_action_->setChecked(false);
 		selected_source_uuid_ = index >= 0 ? source_selector_->itemData(index).toString() : QString();
 		selection_valid_ = false;
 		selected_stable_id_.clear();
@@ -1014,7 +1044,7 @@ void PlaylistControlDock::refresh_playlist()
 		item->setText(2, filename_from_entry(entry));
 		item->setToolTip(2, QString::fromUtf8(entry.path ? entry.path : ""));
 		item->setTextAlignment(0, Qt::AlignCenter);
-		item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+		item->setTextAlignment(1, Qt::AlignCenter);
 		item->setTextAlignment(2, Qt::AlignLeft | Qt::AlignVCenter);
 		item->setData(0, kPathRole, QString::fromUtf8(entry.path ? entry.path : ""));
 		if (entry.stable_id)

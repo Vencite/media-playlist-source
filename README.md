@@ -33,6 +33,9 @@ The upstream repository remains the home of the original project. For the upstre
 - Can start with either the first file or the previously current file when the source is restarted.
 - Preloads the next local video and switches between internal A/B decoders to avoid the blank or transparent frame that can otherwise appear between consecutive files.
 - Routes decoder audio through the parent Media Playlist Source so its mixer gain, mute state, filters, and OBS track routing remain authoritative.
+- Provides a **Playlist Queue** dock with Previous, Now Playing, Up Next, duration, progress, and optional Program-scene following.
+- Provides a **Playlist Control** dock for browsing the configured playlist and safely starting a selected file or folder item with **Play Selected**.
+- Both docks are available through OBS's Docks menu and support independent **Follow Program MPS** behavior from their right-click context menus.
 
 ## Installation
 

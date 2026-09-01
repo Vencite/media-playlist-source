@@ -47,7 +47,7 @@ private:
 	void update_progress(int64_t time_ms, int64_t duration_ms);
 	void schedule_playback_refresh(const char *source_uuid);
 	void schedule_program_refresh();
-	bool apply_program_follow();
+	bool refresh_program_state();
 	void cache_duration(const char *path, int64_t duration_ms);
 	int64_t cached_duration(const char *path) const;
 

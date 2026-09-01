@@ -118,6 +118,28 @@ between the docks is observed.
     Confirm native palette text, separators, progress bar, tree selection, and
     play icon remain legible without fixed theme colors.
 
+## Final playlist dock polish checks
+
+A. Enable Queue Follow on MPS A, then manually choose MPS B. Confirm Queue
+   remains on B, Follow is unchecked, and the Program status is hidden. Queue
+   may retain its lightweight graph listener for source-dropdown markers;
+   Control should release its Follow-only scene listeners. Repeat independently
+   in Control.
+B. With Follow disabled, put MPS A and MPS C visibly in Program. Confirm both
+   entries have the native play indicator and emphasized text in Queue's source
+   dropdown, while no source is selected automatically. With Follow enabled and
+   two active sources, confirm both remain marked and no arbitrary source is
+   selected.
+C. Verify Control's marker column is centered, `#` and all numbers including
+   `1.1`/`1.2` are centered, and `File` plus filenames are left aligned for
+   standalone and folder-child rows.
+D. Under dark and any available light OBS theme, confirm Previous, Current, and
+   Up Next durations (including `--:--`) remain readable without overpowering
+   filenames.
+E. Resize both docks to approximately 280-320 px, 400-500 px, and a wide or
+   floating layout. Confirm icons, header padding, filenames, duration values,
+   and Play Selected remain usable without clipping or a new horizontal bar.
+
 ## Playlist lifecycle regression matrix
 
 Use a local-video playlist with audio containing `A`, `B`, and `C`, and run the
