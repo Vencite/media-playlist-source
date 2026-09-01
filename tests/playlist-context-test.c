@@ -122,6 +122,57 @@ static void test_shuffle_context_does_not_peek_next(void)
 	shuffler_destroy(&shuffler);
 }
 
+static void test_playlist_entries_copy(void)
+{
+	struct media_file_data children[] = {file("one.mp4"), file("two.mp4"), file("three.mp4")};
+	struct media_file_data items[] = {file("intro.mp4"), file("/media/SPONSORS")};
+	struct darray files = {.array = items, .num = 2, .capacity = 2};
+	struct mps_playlist_item_snapshot *snapshot = NULL;
+	size_t item_count = 0;
+
+	items[1].is_folder = true;
+	items[1].folder_items.array = children;
+	items[1].folder_items.num = 3;
+	items[1].folder_items.capacity = 3;
+	children[0].filename = "one.mp4";
+	children[1].filename = "two.mp4";
+	children[2].filename = "three.mp4";
+
+	assert(mps_playlist_entries_copy(&files, &children[1], &snapshot, &item_count));
+	assert(item_count == 5);
+	assert(strcmp(snapshot[0].path, "intro.mp4") == 0);
+	assert(snapshot[0].media_index == 0);
+	assert(!snapshot[0].is_folder);
+	assert(!snapshot[0].is_folder_child);
+	assert(!snapshot[0].is_current);
+	assert(snapshot[1].is_folder);
+	assert(strcmp(snapshot[1].path, "/media/SPONSORS") == 0);
+	assert(snapshot[2].is_folder_child);
+	assert(snapshot[2].media_index == 1);
+	assert(snapshot[2].folder_item_index == 0);
+	assert(!snapshot[2].is_current);
+	assert(snapshot[3].is_current);
+	assert(snapshot[3].media_index == 1);
+	assert(snapshot[3].folder_item_index == 1);
+	assert(strcmp(snapshot[3].filename, "two.mp4") == 0);
+	assert(snapshot[3].path != children[1].path);
+	assert(snapshot[4].folder_item_index == 2);
+	mps_playlist_entries_free(snapshot, item_count);
+
+	snapshot = NULL;
+	item_count = 0;
+	assert(mps_playlist_entries_copy(&files, &items[0], &snapshot, &item_count));
+	assert(snapshot[0].is_current);
+	mps_playlist_entries_free(snapshot, item_count);
+
+	snapshot = NULL;
+	item_count = 0;
+	struct darray empty = {0};
+	assert(mps_playlist_entries_copy(&empty, NULL, &snapshot, &item_count));
+	assert(snapshot == NULL);
+	assert(item_count == 0);
+}
+
 int main(void)
 {
 	test_empty_playlist();
@@ -129,6 +180,7 @@ int main(void)
 	test_sequential_loop_wraps();
 	test_folder_child_is_actual_context();
 	test_shuffle_context_does_not_peek_next();
+	test_playlist_entries_copy();
 	puts("playlist context tests passed");
 	return 0;
 }

@@ -97,3 +97,74 @@ void mps_playlist_context_resolve(const struct mps_playlist_context_input *input
 								 input->current_folder_item_index, input->loop);
 	}
 }
+
+static bool copy_playlist_item_snapshot(struct mps_playlist_item_snapshot *snapshot,
+					const struct media_file_data *media, size_t media_index,
+					size_t folder_item_index, bool is_folder_child,
+					const struct media_file_data *actual_media)
+{
+	snapshot->path = media && media->path ? bstrdup(media->path) : NULL;
+	snapshot->filename = media && media->filename ? bstrdup(media->filename) : NULL;
+	snapshot->media_index = media_index;
+	snapshot->folder_item_index = folder_item_index;
+	snapshot->is_folder = media && media->is_folder;
+	snapshot->is_folder_child = is_folder_child;
+	snapshot->is_current = media == actual_media;
+	return (!media || !media->path || snapshot->path) && (!media || !media->filename || snapshot->filename);
+}
+
+bool mps_playlist_entries_copy(const struct darray *files, const struct media_file_data *actual_media,
+			       struct mps_playlist_item_snapshot **items, size_t *item_count)
+{
+	size_t count = 0;
+	size_t output_index = 0;
+	struct mps_playlist_item_snapshot *output;
+
+	if (!items || !item_count)
+		return false;
+	*items = NULL;
+	*item_count = 0;
+	if (!files || !files->num)
+		return true;
+
+	for (size_t i = 0; i < files->num; i++) {
+		const struct media_file_data *media = &((const struct media_file_data *)files->array)[i];
+		count += 1 + (media->is_folder ? media->folder_items.num : 0);
+	}
+	output = bzalloc(count * sizeof(*output));
+	if (!output)
+		return false;
+
+	for (size_t i = 0; i < files->num; i++) {
+		const struct media_file_data *media = &((const struct media_file_data *)files->array)[i];
+		if (!copy_playlist_item_snapshot(&output[output_index++], media, i, 0, false, actual_media))
+			goto error;
+		if (media->is_folder) {
+			for (size_t j = 0; j < media->folder_items.num; j++) {
+				const struct media_file_data *child = &media->folder_items.array[j];
+				if (!copy_playlist_item_snapshot(&output[output_index++], child, i, j, true,
+								 actual_media))
+					goto error;
+			}
+		}
+	}
+
+	*items = output;
+	*item_count = output_index;
+	return true;
+
+error:
+	mps_playlist_entries_free(output, output_index);
+	return false;
+}
+
+void mps_playlist_entries_free(struct mps_playlist_item_snapshot *items, size_t item_count)
+{
+	if (!items)
+		return;
+	for (size_t i = 0; i < item_count; i++) {
+		bfree(items[i].path);
+		bfree(items[i].filename);
+	}
+	bfree(items);
+}
