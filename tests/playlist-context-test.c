@@ -131,12 +131,17 @@ static void test_playlist_entries_copy(void)
 	size_t item_count = 0;
 
 	items[1].is_folder = true;
+	items[0].id = "intro-id";
+	items[1].id = "sponsors-id";
 	items[1].folder_items.array = children;
 	items[1].folder_items.num = 3;
 	items[1].folder_items.capacity = 3;
 	children[0].filename = "one.mp4";
 	children[1].filename = "two.mp4";
 	children[2].filename = "three.mp4";
+	children[0].parent_id = items[1].id;
+	children[1].parent_id = items[1].id;
+	children[2].parent_id = items[1].id;
 
 	assert(mps_playlist_entries_copy(&files, &children[1], &snapshot, &item_count));
 	assert(item_count == 5);
@@ -145,16 +150,20 @@ static void test_playlist_entries_copy(void)
 	assert(!snapshot[0].is_folder);
 	assert(!snapshot[0].is_folder_child);
 	assert(!snapshot[0].is_current);
+	assert(strcmp(snapshot[0].stable_id, "intro-id") == 0);
 	assert(snapshot[1].is_folder);
 	assert(strcmp(snapshot[1].path, "/media/SPONSORS") == 0);
+	assert(strcmp(snapshot[1].stable_id, "sponsors-id") == 0);
 	assert(snapshot[2].is_folder_child);
 	assert(snapshot[2].media_index == 1);
 	assert(snapshot[2].folder_item_index == 0);
 	assert(!snapshot[2].is_current);
+	assert(strcmp(snapshot[2].stable_id, "sponsors-id/one.mp4") == 0);
 	assert(snapshot[3].is_current);
 	assert(snapshot[3].media_index == 1);
 	assert(snapshot[3].folder_item_index == 1);
 	assert(strcmp(snapshot[3].filename, "two.mp4") == 0);
+	assert(strcmp(snapshot[3].stable_id, "sponsors-id/two.mp4") == 0);
 	assert(snapshot[3].path != children[1].path);
 	assert(snapshot[4].folder_item_index == 2);
 	mps_playlist_entries_free(snapshot, item_count);
@@ -173,6 +182,31 @@ static void test_playlist_entries_copy(void)
 	assert(item_count == 0);
 }
 
+static void test_playlist_entry_identity_survives_reorder(void)
+{
+	struct media_file_data items[] = {file("first.mp4"), file("second.mp4")};
+	struct darray files = {.array = items, .num = 2, .capacity = 2};
+	struct media_file_data reordered[2];
+	struct darray reordered_files = {.array = reordered, .num = 2, .capacity = 2};
+	struct mps_playlist_item_snapshot *snapshot = NULL;
+	struct mps_playlist_item_snapshot *reordered_snapshot = NULL;
+	size_t item_count = 0;
+	size_t reordered_item_count = 0;
+
+	items[0].id = "stable-first";
+	items[1].id = "stable-second";
+	reordered[0] = items[1];
+	reordered[1] = items[0];
+	assert(mps_playlist_entries_copy(&files, NULL, &snapshot, &item_count));
+	assert(strcmp(snapshot[0].stable_id, "stable-first") == 0);
+
+	assert(mps_playlist_entries_copy(&reordered_files, NULL, &reordered_snapshot, &reordered_item_count));
+	assert(strcmp(reordered_snapshot[1].stable_id, "stable-first") == 0);
+	assert(reordered_snapshot[1].media_index == 1);
+	mps_playlist_entries_free(snapshot, item_count);
+	mps_playlist_entries_free(reordered_snapshot, reordered_item_count);
+}
+
 int main(void)
 {
 	test_empty_playlist();
@@ -181,6 +215,7 @@ int main(void)
 	test_folder_child_is_actual_context();
 	test_shuffle_context_does_not_peek_next();
 	test_playlist_entries_copy();
+	test_playlist_entry_identity_survives_reorder();
 	puts("playlist context tests passed");
 	return 0;
 }

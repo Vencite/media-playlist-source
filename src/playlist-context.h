@@ -29,6 +29,7 @@ struct mps_playlist_context {
 struct mps_playlist_item_snapshot {
 	char *path;
 	char *filename;
+	char *stable_id;
 	size_t media_index;
 	size_t folder_item_index;
 	bool is_folder;

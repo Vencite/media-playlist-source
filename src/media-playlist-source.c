@@ -283,13 +283,13 @@ static struct media_playlist_source *mps_registry_lookup(obs_source_t *source)
 	return mps;
 }
 
-bool mps_playlist_snapshot_get(obs_source_t *source, struct mps_playlist_snapshot *snapshot)
+bool mps_playlist_context_snapshot_get(obs_source_t *source, struct mps_playlist_context_snapshot *snapshot)
 {
 	struct media_playlist_source *mps;
 
 	if (!source || !snapshot)
 		return false;
-	*snapshot = (struct mps_playlist_snapshot){0};
+	*snapshot = (struct mps_playlist_context_snapshot){0};
 
 	mps = mps_registry_lookup(source);
 	if (!mps)
@@ -315,28 +315,54 @@ bool mps_playlist_snapshot_get(obs_source_t *source, struct mps_playlist_snapsho
 	snapshot->shuffle = mps->shuffle;
 	bool strings_copied = (!context.previous || snapshot->previous) && (!context.current || snapshot->current) &&
 			      (!context.next_path || snapshot->next);
-	bool entries_copied =
-		mps_playlist_entries_copy(&mps->files.da, mps->actual_media, &snapshot->items, &snapshot->item_count);
 	pthread_mutex_unlock(&mps->mutex);
-	if (!strings_copied || !entries_copied) {
-		mps_playlist_snapshot_free(snapshot);
+	if (!strings_copied) {
+		mps_playlist_context_snapshot_free(snapshot);
 		return false;
 	}
-
-	snapshot->time_ms = obs_source_media_get_time(source);
-	snapshot->duration_ms = obs_source_media_get_duration(source);
 	return true;
 }
 
-void mps_playlist_snapshot_free(struct mps_playlist_snapshot *snapshot)
+void mps_playlist_context_snapshot_free(struct mps_playlist_context_snapshot *snapshot)
 {
 	if (!snapshot)
 		return;
 	bfree(snapshot->previous);
 	bfree(snapshot->current);
 	bfree(snapshot->next);
+	*snapshot = (struct mps_playlist_context_snapshot){0};
+}
+
+bool mps_playlist_entries_snapshot_get(obs_source_t *source, struct mps_playlist_entries_snapshot *snapshot)
+{
+	struct media_playlist_source *mps;
+	bool copied;
+
+	if (!source || !snapshot)
+		return false;
+	*snapshot = (struct mps_playlist_entries_snapshot){0};
+
+	mps = mps_registry_lookup(source);
+	if (!mps)
+		return false;
+
+	pthread_mutex_lock(&mps->mutex);
+	snapshot->shuffle = mps->shuffle;
+	copied = mps_playlist_entries_copy(&mps->files.da, mps->actual_media, &snapshot->items, &snapshot->item_count);
+	pthread_mutex_unlock(&mps->mutex);
+	if (!copied) {
+		mps_playlist_entries_snapshot_free(snapshot);
+		return false;
+	}
+	return true;
+}
+
+void mps_playlist_entries_snapshot_free(struct mps_playlist_entries_snapshot *snapshot)
+{
+	if (!snapshot)
+		return;
 	mps_playlist_entries_free(snapshot->items, snapshot->item_count);
-	*snapshot = (struct mps_playlist_snapshot){0};
+	*snapshot = (struct mps_playlist_entries_snapshot){0};
 }
 
 bool mps_playlist_timing_get(obs_source_t *source, int64_t *time_ms, int64_t *duration_ms)

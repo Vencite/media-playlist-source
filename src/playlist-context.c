@@ -1,5 +1,7 @@
 #include "playlist-context.h"
 
+#include <string.h>
+
 static struct media_file_data *first_media_in_item(struct media_file_data *media)
 {
 	if (!media)
@@ -105,12 +107,25 @@ static bool copy_playlist_item_snapshot(struct mps_playlist_item_snapshot *snaps
 {
 	snapshot->path = media && media->path ? bstrdup(media->path) : NULL;
 	snapshot->filename = media && media->filename ? bstrdup(media->filename) : NULL;
+	if (media && media->id) {
+		snapshot->stable_id = bstrdup(media->id);
+	} else if (media && media->parent_id && media->filename) {
+		const size_t parent_length = strlen(media->parent_id);
+		const size_t filename_length = strlen(media->filename);
+		snapshot->stable_id = bmalloc(parent_length + filename_length + 2);
+		if (snapshot->stable_id) {
+			memcpy(snapshot->stable_id, media->parent_id, parent_length);
+			snapshot->stable_id[parent_length] = '/';
+			memcpy(snapshot->stable_id + parent_length + 1, media->filename, filename_length + 1);
+		}
+	}
 	snapshot->media_index = media_index;
 	snapshot->folder_item_index = folder_item_index;
 	snapshot->is_folder = media && media->is_folder;
 	snapshot->is_folder_child = is_folder_child;
 	snapshot->is_current = media == actual_media;
-	return (!media || !media->path || snapshot->path) && (!media || !media->filename || snapshot->filename);
+	return (!media || !media->path || snapshot->path) && (!media || !media->filename || snapshot->filename) &&
+	       (!media || (!media->id && !media->parent_id) || snapshot->stable_id);
 }
 
 bool mps_playlist_entries_copy(const struct darray *files, const struct media_file_data *actual_media,
@@ -165,6 +180,7 @@ void mps_playlist_entries_free(struct mps_playlist_item_snapshot *items, size_t 
 	for (size_t i = 0; i < item_count; i++) {
 		bfree(items[i].path);
 		bfree(items[i].filename);
+		bfree(items[i].stable_id);
 	}
 	bfree(items);
 }

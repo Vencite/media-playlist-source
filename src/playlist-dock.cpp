@@ -89,6 +89,7 @@ constexpr const char *kControlDockId = "media-playlist-control-dock";
 constexpr int kTimerIntervalMs = 250;
 constexpr int kMediaIndexRole = Qt::UserRole;
 constexpr int kFolderItemIndexRole = Qt::UserRole + 1;
+constexpr int kStableIdRole = Qt::UserRole + 2;
 
 struct SourceInfo {
 	QString uuid;
@@ -194,12 +195,15 @@ QString format_media_time(int64_t milliseconds)
 	return QStringLiteral("%1:%2").arg(minutes, 2, 10, QLatin1Char('0')).arg(seconds, 2, 10, QLatin1Char('0'));
 }
 
-void set_selected_item_data(QTreeWidgetItem *item, std::size_t *media_index, std::size_t *folder_item_index)
+void set_selected_item_data(QTreeWidgetItem *item, std::size_t *media_index, std::size_t *folder_item_index,
+			    QString *stable_id = nullptr)
 {
 	if (!item || !media_index || !folder_item_index || !item->data(0, kMediaIndexRole).isValid())
 		return;
 	*media_index = static_cast<std::size_t>(item->data(0, kMediaIndexRole).toULongLong());
 	*folder_item_index = static_cast<std::size_t>(item->data(0, kFolderItemIndexRole).toULongLong());
+	if (stable_id)
+		*stable_id = item->data(0, kStableIdRole).toString();
 }
 
 PlaylistQueueDock *queue_dock_instance;
@@ -281,8 +285,7 @@ PlaylistQueueDock::~PlaylistQueueDock()
 
 void PlaylistQueueDock::playback_changed(void *data, const char *source_uuid)
 {
-	(void)source_uuid;
-	static_cast<PlaylistQueueDock *>(data)->schedule_refresh();
+	static_cast<PlaylistQueueDock *>(data)->schedule_playback_refresh(source_uuid);
 }
 
 void PlaylistQueueDock::source_event(void *data, calldata_t *calldata)
@@ -306,6 +309,38 @@ void PlaylistQueueDock::schedule_refresh()
 		[this] {
 			refresh_queued_.store(false);
 			refresh_sources();
+		},
+		Qt::QueuedConnection);
+}
+
+void PlaylistQueueDock::schedule_playback_refresh(const char *source_uuid)
+{
+	if (!source_uuid || !*source_uuid)
+		return;
+
+	bool queue_refresh = false;
+	{
+		QMutexLocker lock(&playback_refresh_mutex_);
+		pending_playback_uuids_.insert(QString::fromUtf8(source_uuid));
+		if (!playback_refresh_queued_) {
+			playback_refresh_queued_ = true;
+			queue_refresh = true;
+		}
+	}
+	if (!queue_refresh)
+		return;
+
+	QMetaObject::invokeMethod(
+		this,
+		[this] {
+			QSet<QString> changed_uuids;
+			{
+				QMutexLocker lock(&playback_refresh_mutex_);
+				changed_uuids.swap(pending_playback_uuids_);
+				playback_refresh_queued_ = false;
+			}
+			if (changed_uuids.contains(selected_source_uuid_))
+				refresh_snapshot();
 		},
 		Qt::QueuedConnection);
 }
@@ -357,11 +392,14 @@ void PlaylistQueueDock::refresh_snapshot()
 		return;
 	}
 
-	struct mps_playlist_snapshot snapshot = {0};
-	const bool found = mps_playlist_snapshot_get(source, &snapshot);
+	struct mps_playlist_context_snapshot snapshot = {0};
+	const bool found = mps_playlist_context_snapshot_get(source, &snapshot);
+	int64_t time_ms = 0;
+	int64_t duration_ms = 0;
+	const bool timing_found = found && mps_playlist_timing_get(source, &time_ms, &duration_ms);
 	obs_source_release(source);
 	if (!found) {
-		mps_playlist_snapshot_free(&snapshot);
+		mps_playlist_context_snapshot_free(&snapshot);
 		clear_snapshot();
 		return;
 	}
@@ -370,8 +408,8 @@ void PlaylistQueueDock::refresh_snapshot()
 	current_value_->setFilePath(snapshot.current);
 	next_value_->setFilePath(snapshot.next);
 	has_current_ = snapshot.current != nullptr;
-	update_progress(snapshot.time_ms, snapshot.duration_ms);
-	mps_playlist_snapshot_free(&snapshot);
+	update_progress(timing_found ? time_ms : -1, timing_found ? duration_ms : 0);
+	mps_playlist_context_snapshot_free(&snapshot);
 }
 
 void PlaylistQueueDock::refresh_progress()
@@ -472,13 +510,16 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	connect(source_selector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
 		selected_source_uuid_ = index >= 0 ? source_selector_->itemData(index).toString() : QString();
 		selection_valid_ = false;
+		selected_stable_id_.clear();
 		refresh_playlist();
 	});
 	connect(playlist_, &QTreeWidget::itemSelectionChanged, this, [this] {
 		QTreeWidgetItem *item = playlist_->currentItem();
 		selection_valid_ = item && item->data(0, kMediaIndexRole).isValid();
+		selected_stable_id_.clear();
 		if (selection_valid_)
-			set_selected_item_data(item, &selected_media_index_, &selected_folder_item_index_);
+			set_selected_item_data(item, &selected_media_index_, &selected_folder_item_index_,
+					       &selected_stable_id_);
 		update_play_button();
 	});
 	connect(play_button_, &QPushButton::clicked, this, &PlaylistControlDock::play_selected);
@@ -498,8 +539,7 @@ PlaylistControlDock::~PlaylistControlDock()
 
 void PlaylistControlDock::playback_changed(void *data, const char *source_uuid)
 {
-	(void)source_uuid;
-	static_cast<PlaylistControlDock *>(data)->schedule_refresh();
+	static_cast<PlaylistControlDock *>(data)->schedule_playback_refresh(source_uuid);
 }
 
 void PlaylistControlDock::source_event(void *data, calldata_t *calldata)
@@ -523,6 +563,38 @@ void PlaylistControlDock::schedule_refresh()
 		[this] {
 			refresh_queued_.store(false);
 			refresh_sources();
+		},
+		Qt::QueuedConnection);
+}
+
+void PlaylistControlDock::schedule_playback_refresh(const char *source_uuid)
+{
+	if (!source_uuid || !*source_uuid)
+		return;
+
+	bool queue_refresh = false;
+	{
+		QMutexLocker lock(&playback_refresh_mutex_);
+		pending_playback_uuids_.insert(QString::fromUtf8(source_uuid));
+		if (!playback_refresh_queued_) {
+			playback_refresh_queued_ = true;
+			queue_refresh = true;
+		}
+	}
+	if (!queue_refresh)
+		return;
+
+	QMetaObject::invokeMethod(
+		this,
+		[this] {
+			QSet<QString> changed_uuids;
+			{
+				QMutexLocker lock(&playback_refresh_mutex_);
+				changed_uuids.swap(pending_playback_uuids_);
+				playback_refresh_queued_ = false;
+			}
+			if (changed_uuids.contains(selected_source_uuid_))
+				refresh_playlist();
 		},
 		Qt::QueuedConnection);
 }
@@ -553,16 +625,17 @@ void PlaylistControlDock::refresh_sources()
 
 void PlaylistControlDock::refresh_playlist()
 {
-	std::size_t previous_media_index = 0;
-	std::size_t previous_folder_item_index = 0;
-	const bool restore_selection = selection_valid_;
+	QString previous_stable_id;
+	const bool restore_selection = selection_valid_ && !selected_stable_id_.isEmpty();
 	const int scroll_value = playlist_->verticalScrollBar()->value();
 	if (restore_selection)
-		set_selected_item_data(playlist_->currentItem(), &previous_media_index, &previous_folder_item_index);
+		set_selected_item_data(playlist_->currentItem(), &selected_media_index_, &selected_folder_item_index_,
+				       &previous_stable_id);
 
 	const QSignalBlocker blocker(playlist_);
 	playlist_->clear();
 	selection_valid_ = false;
+	selected_stable_id_.clear();
 	shuffle_info_->setVisible(false);
 	if (selected_source_uuid_.isEmpty()) {
 		update_play_button();
@@ -576,11 +649,11 @@ void PlaylistControlDock::refresh_playlist()
 		return;
 	}
 
-	struct mps_playlist_snapshot snapshot = {0};
-	const bool found = mps_playlist_snapshot_get(source, &snapshot);
+	struct mps_playlist_entries_snapshot snapshot = {0};
+	const bool found = mps_playlist_entries_snapshot_get(source, &snapshot);
 	obs_source_release(source);
 	if (!found) {
-		mps_playlist_snapshot_free(&snapshot);
+		mps_playlist_entries_snapshot_free(&snapshot);
 		update_play_button();
 		return;
 	}
@@ -611,6 +684,8 @@ void PlaylistControlDock::refresh_playlist()
 		item->setText(1, number);
 		item->setText(2, filename_from_entry(entry));
 		item->setToolTip(2, QString::fromUtf8(entry.path ? entry.path : ""));
+		if (entry.stable_id)
+			item->setData(0, kStableIdRole, QString::fromUtf8(entry.stable_id));
 		if (!entry.is_folder) {
 			item->setData(0, kMediaIndexRole, QVariant::fromValue<qulonglong>(entry.media_index));
 			item->setData(0, kFolderItemIndexRole,
@@ -622,19 +697,19 @@ void PlaylistControlDock::refresh_playlist()
 			item->setFont(2, font);
 		}
 
-		if (restore_selection && !entry.is_folder && entry.media_index == previous_media_index &&
-		    entry.folder_item_index == previous_folder_item_index)
+		if (restore_selection && !entry.is_folder && entry.stable_id &&
+		    QString::fromUtf8(entry.stable_id) == previous_stable_id)
 			restored_item = item;
 	}
 
 	if (restored_item) {
 		playlist_->setCurrentItem(restored_item);
 		selection_valid_ = true;
-		selected_media_index_ = previous_media_index;
-		selected_folder_item_index_ = previous_folder_item_index;
+		set_selected_item_data(restored_item, &selected_media_index_, &selected_folder_item_index_,
+				       &selected_stable_id_);
 	}
 	playlist_->verticalScrollBar()->setValue(scroll_value);
-	mps_playlist_snapshot_free(&snapshot);
+	mps_playlist_entries_snapshot_free(&snapshot);
 	update_play_button();
 }
 
@@ -666,7 +741,7 @@ void PlaylistControlDock::play_selected()
 	}
 	obs_source_release(source);
 	if (called)
-		schedule_refresh();
+		schedule_playback_refresh(uuid.constData());
 }
 
 extern "C" void mps_playlist_dock_register(void)

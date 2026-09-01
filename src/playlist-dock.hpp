@@ -6,6 +6,8 @@
 
 #include <obs-frontend-api.h>
 
+#include <QMutex>
+#include <QSet>
 #include <QString>
 #include <QWidget>
 
@@ -40,6 +42,7 @@ private:
 	void refresh_progress();
 	void clear_snapshot();
 	void update_progress(int64_t time_ms, int64_t duration_ms);
+	void schedule_playback_refresh(const char *source_uuid);
 
 	QComboBox *source_selector_ = nullptr;
 	ElidedFileLabel *previous_value_ = nullptr;
@@ -52,6 +55,9 @@ private:
 	QString selected_source_uuid_;
 	bool has_current_ = false;
 	std::atomic_bool refresh_queued_ = false;
+	QMutex playback_refresh_mutex_;
+	QSet<QString> pending_playback_uuids_;
+	bool playback_refresh_queued_ = false;
 };
 
 class PlaylistControlDock final : public QWidget {
@@ -70,14 +76,19 @@ private:
 	void refresh_playlist();
 	void update_play_button();
 	void play_selected();
+	void schedule_playback_refresh(const char *source_uuid);
 
 	QComboBox *source_selector_ = nullptr;
 	QLabel *shuffle_info_ = nullptr;
 	QTreeWidget *playlist_ = nullptr;
 	QPushButton *play_button_ = nullptr;
 	QString selected_source_uuid_;
+	QString selected_stable_id_;
 	bool selection_valid_ = false;
 	std::size_t selected_media_index_ = 0;
 	std::size_t selected_folder_item_index_ = 0;
 	std::atomic_bool refresh_queued_ = false;
+	QMutex playback_refresh_mutex_;
+	QSet<QString> pending_playback_uuids_;
+	bool playback_refresh_queued_ = false;
 };
