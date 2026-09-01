@@ -33,6 +33,7 @@ void mps_playlist_context_snapshot_free(struct mps_playlist_context_snapshot *sn
 bool mps_playlist_entries_snapshot_get(obs_source_t *source, struct mps_playlist_entries_snapshot *snapshot);
 void mps_playlist_entries_snapshot_free(struct mps_playlist_entries_snapshot *snapshot);
 bool mps_playlist_timing_get(obs_source_t *source, int64_t *time_ms, int64_t *duration_ms);
+bool mps_playlist_standby_duration_get(obs_source_t *source, const char *expected_path, int64_t *duration_ms);
 
 void mps_playlist_change_add_listener(mps_playlist_change_callback_t callback, void *data);
 void mps_playlist_change_remove_listener(mps_playlist_change_callback_t callback, void *data);

@@ -5,9 +5,11 @@
 #include <cstring>
 
 #include <QAbstractItemView>
+#include <QAction>
 #include <QComboBox>
 #include <QFont>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QHideEvent>
@@ -20,6 +22,7 @@
 #include <QShowEvent>
 #include <QSignalBlocker>
 #include <QSizePolicy>
+#include <QStyle>
 #include <QTimer>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -90,6 +93,8 @@ constexpr int kTimerIntervalMs = 250;
 constexpr int kMediaIndexRole = Qt::UserRole;
 constexpr int kFolderItemIndexRole = Qt::UserRole + 1;
 constexpr int kStableIdRole = Qt::UserRole + 2;
+constexpr int kPathRole = Qt::UserRole + 3;
+constexpr std::size_t kMaxProgramSceneDepth = 64;
 
 struct SourceInfo {
 	QString uuid;
@@ -124,6 +129,98 @@ QVector<SourceInfo> enumerate_mps_sources()
 	QVector<SourceInfo> sources;
 	obs_enum_sources(enum_mps_source, &sources);
 	return sources;
+}
+
+struct ProgramSourceTraversal {
+	QSet<QString> source_uuids;
+	QSet<QString> scene_uuids;
+	QSet<const obs_source_t *> visited_scenes;
+};
+
+struct ProgramSceneEnumeration {
+	ProgramSourceTraversal *traversal;
+	std::size_t depth;
+};
+
+void enumerate_program_scene(obs_scene_t *scene, ProgramSourceTraversal *traversal, std::size_t depth);
+
+bool enum_program_scene_item(obs_scene_t *, obs_sceneitem_t *item, void *data)
+{
+	auto *enumeration = static_cast<ProgramSceneEnumeration *>(data);
+	if (!obs_sceneitem_visible(item))
+		return true;
+
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (!source)
+		return true;
+	const char *id = obs_source_get_unversioned_id(source);
+	if (id && std::strcmp(id, kSourceId) == 0) {
+		const char *uuid = obs_source_get_uuid(source);
+		if (uuid && *uuid)
+			enumeration->traversal->source_uuids.insert(QString::fromUtf8(uuid));
+	}
+
+	obs_scene_t *nested_scene = obs_sceneitem_is_group(item) ? obs_sceneitem_group_get_scene(item)
+								 : obs_scene_from_source(source);
+	if (nested_scene)
+		enumerate_program_scene(nested_scene, enumeration->traversal, enumeration->depth + 1);
+	return true;
+}
+
+void enumerate_program_scene(obs_scene_t *scene, ProgramSourceTraversal *traversal, std::size_t depth)
+{
+	if (!scene || !traversal || depth > kMaxProgramSceneDepth)
+		return;
+	obs_source_t *scene_source = obs_scene_get_source(scene);
+	if (!scene_source || traversal->visited_scenes.contains(scene_source))
+		return;
+	traversal->visited_scenes.insert(scene_source);
+	const char *scene_uuid = obs_source_get_uuid(scene_source);
+	if (scene_uuid && *scene_uuid)
+		traversal->scene_uuids.insert(QString::fromUtf8(scene_uuid));
+	ProgramSceneEnumeration enumeration = {traversal, depth};
+	obs_scene_enum_items(scene, enum_program_scene_item, &enumeration);
+}
+
+ProgramSourceTraversal enumerate_program_sources()
+{
+	ProgramSourceTraversal traversal;
+	obs_source_t *program_source = obs_frontend_get_current_scene();
+	if (!program_source)
+		return traversal;
+
+	obs_scene_t *program_scene = obs_scene_from_source(program_source);
+	if (program_scene)
+		enumerate_program_scene(program_scene, &traversal, 0);
+	obs_source_release(program_source);
+	return traversal;
+}
+
+void set_program_scene_event_connections(QSet<QString> &connected, const QSet<QString> &desired,
+					 signal_callback_t callback, void *data)
+{
+	static const char *event_names[] = {"item_add", "item_remove", "item_visible"};
+	for (const QString &uuid : connected - desired) {
+		const QByteArray utf8 = uuid.toUtf8();
+		obs_source_t *source = obs_get_source_by_uuid(utf8.constData());
+		if (!source)
+			continue;
+		signal_handler_t *handler = obs_source_get_signal_handler(source);
+		for (const char *event_name : event_names)
+			signal_handler_disconnect(handler, event_name, callback, data);
+		obs_source_release(source);
+	}
+	for (const QString &uuid : desired - connected) {
+		const QByteArray utf8 = uuid.toUtf8();
+		obs_source_t *source = obs_get_source_by_uuid(utf8.constData());
+		if (!source)
+			continue;
+		signal_handler_t *handler = obs_source_get_signal_handler(source);
+		for (const char *event_name : event_names)
+			signal_handler_connect(handler, event_name, callback, data);
+		obs_source_release(source);
+	}
+	connected = desired;
 }
 
 void connect_obs_events(signal_callback_t callback, void *data)
@@ -161,12 +258,37 @@ bool needs_source_refresh(enum obs_frontend_event event)
 	}
 }
 
-QLabel *make_section_label(const QString &text, QWidget *parent = nullptr)
+QString follow_status_text(std::size_t active_source_count)
+{
+	if (!active_source_count)
+		return QObject::tr("No active MPS");
+	if (active_source_count == 1)
+		return QObject::tr("Program");
+	return QObject::tr("%1 active MPS").arg(active_source_count);
+}
+
+void configure_follow_context_menu(QWidget *dock, QWidget *source_header, QAction *action)
+{
+	dock->setContextMenuPolicy(Qt::ActionsContextMenu);
+	dock->addAction(action);
+	source_header->setContextMenuPolicy(Qt::ActionsContextMenu);
+	source_header->addAction(action);
+}
+
+QLabel *make_section_label(const QString &text, QWidget *parent = nullptr, bool bold = true)
 {
 	auto *label = new QLabel(text, parent);
 	QFont font = label->font();
-	font.setBold(true);
+	font.setBold(bold);
 	label->setFont(font);
+	return label;
+}
+
+QLabel *make_secondary_label(const QString &text, QWidget *parent = nullptr)
+{
+	auto *label = new QLabel(text, parent);
+	label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+	label->setForegroundRole(QPalette::PlaceholderText);
 	return label;
 }
 
@@ -181,7 +303,7 @@ QFrame *make_separator(QWidget *parent = nullptr)
 QString format_media_time(int64_t milliseconds)
 {
 	if (milliseconds < 0)
-		return QStringLiteral("—");
+		return QStringLiteral("--:--");
 
 	const int64_t total_seconds = milliseconds / 1000;
 	const int64_t seconds = total_seconds % 60;
@@ -193,6 +315,11 @@ QString format_media_time(int64_t milliseconds)
 			.arg(minutes, 2, 10, QLatin1Char('0'))
 			.arg(seconds, 2, 10, QLatin1Char('0'));
 	return QStringLiteral("%1:%2").arg(minutes, 2, 10, QLatin1Char('0')).arg(seconds, 2, 10, QLatin1Char('0'));
+}
+
+QString format_media_duration(int64_t milliseconds)
+{
+	return milliseconds > 0 ? format_media_time(milliseconds) : QStringLiteral("--:--");
 }
 
 void set_selected_item_data(QTreeWidgetItem *item, std::size_t *media_index, std::size_t *folder_item_index,
@@ -217,48 +344,78 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 
 	auto *layout = new QVBoxLayout(this);
 	layout->setContentsMargins(8, 8, 8, 8);
-	layout->setSpacing(7);
-	layout->addWidget(make_section_label(tr("Source"), this));
-	source_selector_ = new QComboBox(this);
+	layout->setSpacing(8);
+
+	auto *source_header = new QWidget(this);
+	auto *source_layout = new QGridLayout(source_header);
+	source_layout->setContentsMargins(0, 0, 0, 0);
+	source_layout->setHorizontalSpacing(8);
+	source_layout->setVerticalSpacing(4);
+	source_layout->addWidget(make_section_label(tr("Source"), source_header), 0, 0);
+	follow_status_ = make_secondary_label(QString(), source_header);
+	follow_status_->setVisible(false);
+	source_layout->addWidget(follow_status_, 0, 1);
+	source_selector_ = new QComboBox(source_header);
 	source_selector_->setSizeAdjustPolicy(QComboBox::AdjustToContentsOnFirstShow);
 	source_selector_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-	layout->addWidget(source_selector_);
+	source_layout->addWidget(source_selector_, 1, 0, 1, 2);
+	source_layout->setColumnStretch(0, 1);
+	layout->addWidget(source_header);
 	layout->addWidget(make_separator(this));
 
-	layout->addWidget(make_section_label(tr("Previous"), this));
+	auto *context_layout = new QGridLayout;
+	context_layout->setContentsMargins(0, 0, 0, 0);
+	context_layout->setHorizontalSpacing(8);
+	context_layout->setVerticalSpacing(5);
+	context_layout->setColumnStretch(0, 1);
+	context_layout->addWidget(make_section_label(tr("Previous"), this, false), 0, 0);
+	previous_duration_value_ = make_secondary_label(QStringLiteral("--:--"), this);
+	context_layout->addWidget(previous_duration_value_, 0, 1);
 	previous_value_ = new ElidedFileLabel(this);
-	layout->addWidget(previous_value_);
+	context_layout->addWidget(previous_value_, 1, 0, 1, 2);
+	context_layout->addWidget(make_separator(this), 2, 0, 1, 2);
 
-	auto *current_frame = new QFrame(this);
-	current_frame->setFrameShape(QFrame::StyledPanel);
-	current_frame->setFrameShadow(QFrame::Raised);
-	auto *current_layout = new QVBoxLayout(current_frame);
-	current_layout->setContentsMargins(8, 8, 8, 8);
-	current_layout->setSpacing(5);
-	current_layout->addWidget(make_section_label(tr("Now Playing"), current_frame));
-	current_value_ = new ElidedFileLabel(current_frame);
+	context_layout->addWidget(make_section_label(tr("Now Playing"), this), 3, 0);
+	current_duration_value_ = make_secondary_label(QStringLiteral("--:--"), this);
+	context_layout->addWidget(current_duration_value_, 3, 1);
+	current_value_ = new ElidedFileLabel(this);
 	QFont current_font = current_value_->font();
 	current_font.setBold(true);
 	current_value_->setFont(current_font);
-	current_layout->addWidget(current_value_);
-	progress_bar_ = new QProgressBar(current_frame);
+	context_layout->addWidget(current_value_, 4, 0, 1, 2);
+	progress_bar_ = new QProgressBar(this);
 	progress_bar_->setTextVisible(false);
 	progress_bar_->setRange(0, 1);
 	progress_bar_->setValue(0);
-	current_layout->addWidget(progress_bar_);
-	auto *time_layout = new QHBoxLayout;
-	elapsed_value_ = new QLabel(QStringLiteral("— / —"), current_frame);
-	remaining_value_ = new QLabel(QStringLiteral("— remaining"), current_frame);
-	time_layout->addWidget(elapsed_value_);
-	time_layout->addStretch();
-	time_layout->addWidget(remaining_value_);
-	current_layout->addLayout(time_layout);
-	layout->addWidget(current_frame);
+	context_layout->addWidget(progress_bar_, 5, 0, 1, 2);
+	elapsed_value_ = new QLabel(QStringLiteral("--:--"), this);
+	elapsed_value_->setForegroundRole(QPalette::PlaceholderText);
+	remaining_value_ = make_secondary_label(QStringLiteral("--:--"), this);
+	context_layout->addWidget(elapsed_value_, 6, 0);
+	context_layout->addWidget(remaining_value_, 6, 1);
+	context_layout->addWidget(make_separator(this), 7, 0, 1, 2);
 
-	layout->addWidget(make_section_label(tr("Up Next"), this));
+	context_layout->addWidget(make_section_label(tr("Up Next"), this, false), 8, 0);
+	next_duration_value_ = make_secondary_label(QStringLiteral("--:--"), this);
+	context_layout->addWidget(next_duration_value_, 8, 1);
 	next_value_ = new ElidedFileLabel(this);
-	layout->addWidget(next_value_);
+	context_layout->addWidget(next_value_, 9, 0, 1, 2);
+	layout->addLayout(context_layout);
 	layout->addStretch();
+
+	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
+	follow_program_action_->setCheckable(true);
+	configure_follow_context_menu(this, source_header, follow_program_action_);
+	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
+		follow_program_ = enabled;
+		follow_status_->setVisible(enabled);
+		if (enabled) {
+			if (apply_program_follow())
+				refresh_snapshot();
+		} else {
+			set_program_scene_event_connections(program_scene_uuids_, {}, program_scene_event, this);
+		}
+	});
 
 	progress_timer_ = new QTimer(this);
 	progress_timer_->setInterval(kTimerIntervalMs);
@@ -278,6 +435,7 @@ PlaylistQueueDock::~PlaylistQueueDock()
 {
 	if (progress_timer_)
 		progress_timer_->stop();
+	set_program_scene_event_connections(program_scene_uuids_, {}, program_scene_event, this);
 	mps_playlist_change_remove_listener(playback_changed, this);
 	obs_frontend_remove_event_callback(frontend_event, this);
 	disconnect_obs_events(source_event, this);
@@ -294,10 +452,19 @@ void PlaylistQueueDock::source_event(void *data, calldata_t *calldata)
 	static_cast<PlaylistQueueDock *>(data)->schedule_refresh();
 }
 
+void PlaylistQueueDock::program_scene_event(void *data, calldata_t *calldata)
+{
+	(void)calldata;
+	static_cast<PlaylistQueueDock *>(data)->schedule_program_refresh();
+}
+
 void PlaylistQueueDock::frontend_event(enum obs_frontend_event event, void *data)
 {
+	auto *dock = static_cast<PlaylistQueueDock *>(data);
 	if (needs_source_refresh(event))
-		static_cast<PlaylistQueueDock *>(data)->schedule_refresh();
+		dock->schedule_refresh();
+	else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED)
+		dock->schedule_program_refresh();
 }
 
 void PlaylistQueueDock::schedule_refresh()
@@ -345,6 +512,43 @@ void PlaylistQueueDock::schedule_playback_refresh(const char *source_uuid)
 		Qt::QueuedConnection);
 }
 
+void PlaylistQueueDock::schedule_program_refresh()
+{
+	if (!follow_program_ || program_refresh_queued_.exchange(true))
+		return;
+	QMetaObject::invokeMethod(
+		this,
+		[this] {
+			program_refresh_queued_.store(false);
+			if (apply_program_follow())
+				refresh_snapshot();
+		},
+		Qt::QueuedConnection);
+}
+
+bool PlaylistQueueDock::apply_program_follow()
+{
+	if (!follow_program_)
+		return false;
+	const ProgramSourceTraversal program = enumerate_program_sources();
+	set_program_scene_event_connections(program_scene_uuids_, program.scene_uuids, program_scene_event, this);
+	const QSet<QString> &active_sources = program.source_uuids;
+	follow_status_->setText(follow_status_text(static_cast<std::size_t>(active_sources.size())));
+	if (active_sources.size() != 1)
+		return false;
+
+	const QString source_uuid = *active_sources.cbegin();
+	if (source_uuid == selected_source_uuid_)
+		return false;
+	const int index = source_selector_->findData(source_uuid);
+	if (index < 0)
+		return false;
+	const QSignalBlocker blocker(source_selector_);
+	source_selector_->setCurrentIndex(index);
+	selected_source_uuid_ = source_uuid;
+	return true;
+}
+
 void PlaylistQueueDock::refresh_sources()
 {
 	const QVector<SourceInfo> sources = enumerate_mps_sources();
@@ -366,6 +570,8 @@ void PlaylistQueueDock::refresh_sources()
 		else
 			selected_source_uuid_.clear();
 	}
+	if (follow_program_)
+		apply_program_follow();
 	refresh_snapshot();
 }
 
@@ -374,8 +580,26 @@ void PlaylistQueueDock::clear_snapshot()
 	previous_value_->setFilePath(nullptr);
 	current_value_->setFilePath(nullptr);
 	next_value_->setFilePath(nullptr);
+	previous_duration_value_->setText(QStringLiteral("--:--"));
+	current_duration_value_->setText(QStringLiteral("--:--"));
+	next_duration_value_->setText(QStringLiteral("--:--"));
+	current_path_.clear();
 	has_current_ = false;
 	update_progress(-1, 0);
+}
+
+void PlaylistQueueDock::cache_duration(const char *path, int64_t duration_ms)
+{
+	if (!path || !*path || duration_ms <= 0 || selected_source_uuid_.isEmpty())
+		return;
+	duration_cache_.insert(selected_source_uuid_ + QLatin1Char('\n') + QString::fromUtf8(path), duration_ms);
+}
+
+int64_t PlaylistQueueDock::cached_duration(const char *path) const
+{
+	if (!path || !*path || selected_source_uuid_.isEmpty())
+		return -1;
+	return duration_cache_.value(selected_source_uuid_ + QLatin1Char('\n') + QString::fromUtf8(path), -1);
 }
 
 void PlaylistQueueDock::refresh_snapshot()
@@ -396,7 +620,11 @@ void PlaylistQueueDock::refresh_snapshot()
 	const bool found = mps_playlist_context_snapshot_get(source, &snapshot);
 	int64_t time_ms = 0;
 	int64_t duration_ms = 0;
+	int64_t standby_duration_ms = 0;
 	const bool timing_found = found && mps_playlist_timing_get(source, &time_ms, &duration_ms);
+	const bool standby_duration_found =
+		found && snapshot.next &&
+		mps_playlist_standby_duration_get(source, snapshot.next, &standby_duration_ms);
 	obs_source_release(source);
 	if (!found) {
 		mps_playlist_context_snapshot_free(&snapshot);
@@ -407,6 +635,13 @@ void PlaylistQueueDock::refresh_snapshot()
 	previous_value_->setFilePath(snapshot.previous);
 	current_value_->setFilePath(snapshot.current);
 	next_value_->setFilePath(snapshot.next);
+	if (timing_found)
+		cache_duration(snapshot.current, duration_ms);
+	if (standby_duration_found)
+		cache_duration(snapshot.next, standby_duration_ms);
+	previous_duration_value_->setText(format_media_duration(cached_duration(snapshot.previous)));
+	next_duration_value_->setText(format_media_duration(cached_duration(snapshot.next)));
+	current_path_ = QString::fromUtf8(snapshot.current ? snapshot.current : "");
 	has_current_ = snapshot.current != nullptr;
 	update_progress(timing_found ? time_ms : -1, timing_found ? duration_ms : 0);
 	mps_playlist_context_snapshot_free(&snapshot);
@@ -428,10 +663,13 @@ void PlaylistQueueDock::refresh_progress()
 	int64_t duration_ms = 0;
 	const bool found = mps_playlist_timing_get(source, &time_ms, &duration_ms);
 	obs_source_release(source);
-	if (found)
+	if (found) {
+		const QByteArray current_path = current_path_.toUtf8();
+		cache_duration(current_path.constData(), duration_ms);
 		update_progress(time_ms, duration_ms);
-	else
+	} else {
 		clear_snapshot();
+	}
 }
 
 void PlaylistQueueDock::update_progress(int64_t time_ms, int64_t duration_ms)
@@ -439,8 +677,9 @@ void PlaylistQueueDock::update_progress(int64_t time_ms, int64_t duration_ms)
 	if (!has_current_ || duration_ms <= 0) {
 		progress_bar_->setRange(0, 1);
 		progress_bar_->setValue(0);
-		elapsed_value_->setText(QStringLiteral("— / —"));
-		remaining_value_->setText(QStringLiteral("— remaining"));
+		current_duration_value_->setText(QStringLiteral("--:--"));
+		elapsed_value_->setText(QStringLiteral("--:--"));
+		remaining_value_->setText(QStringLiteral("--:--"));
 		return;
 	}
 
@@ -451,8 +690,9 @@ void PlaylistQueueDock::update_progress(int64_t time_ms, int64_t duration_ms)
 	const int value = static_cast<int>((static_cast<double>(time_ms) * 1000.0) / duration_ms);
 	progress_bar_->setRange(0, 1000);
 	progress_bar_->setValue(value);
-	elapsed_value_->setText(format_media_time(time_ms) + QStringLiteral(" / ") + format_media_time(duration_ms));
-	remaining_value_->setText(format_media_time(duration_ms - time_ms) + QStringLiteral(" remaining"));
+	current_duration_value_->setText(format_media_duration(duration_ms));
+	elapsed_value_->setText(format_media_time(time_ms));
+	remaining_value_->setText(QStringLiteral("-") + format_media_time(duration_ms - time_ms));
 }
 
 void PlaylistQueueDock::showEvent(QShowEvent *event)
@@ -474,38 +714,76 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 
 	auto *layout = new QVBoxLayout(this);
 	layout->setContentsMargins(8, 8, 8, 8);
-	layout->setSpacing(7);
-	layout->addWidget(make_section_label(tr("Source"), this));
-	source_selector_ = new QComboBox(this);
+	layout->setSpacing(8);
+
+	auto *source_header = new QWidget(this);
+	auto *source_layout = new QGridLayout(source_header);
+	source_layout->setContentsMargins(0, 0, 0, 0);
+	source_layout->setHorizontalSpacing(8);
+	source_layout->setVerticalSpacing(4);
+	source_layout->addWidget(make_section_label(tr("Source"), source_header), 0, 0);
+	follow_status_ = make_secondary_label(QString(), source_header);
+	follow_status_->setVisible(false);
+	source_layout->addWidget(follow_status_, 0, 1);
+	source_selector_ = new QComboBox(source_header);
 	source_selector_->setSizeAdjustPolicy(QComboBox::AdjustToContentsOnFirstShow);
 	source_selector_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-	layout->addWidget(source_selector_);
+	source_layout->addWidget(source_selector_, 1, 0, 1, 2);
+	source_layout->setColumnStretch(0, 1);
+	layout->addWidget(source_header);
 	layout->addWidget(make_separator(this));
-	layout->addWidget(make_section_label(tr("Playlist"), this));
-	shuffle_info_ = new QLabel(tr("Shuffle is enabled; this is the configured playlist order."), this);
-	shuffle_info_->setWordWrap(true);
+
+	auto *playlist_header = new QGridLayout;
+	playlist_header->setContentsMargins(0, 0, 0, 0);
+	playlist_header->setColumnStretch(0, 1);
+	playlist_header->addWidget(make_section_label(tr("Playlist"), this), 0, 0);
+	shuffle_info_ = make_secondary_label(tr("Shuffle ON"), this);
 	shuffle_info_->setVisible(false);
-	layout->addWidget(shuffle_info_);
+	playlist_header->addWidget(shuffle_info_, 0, 1);
+	layout->addLayout(playlist_header);
+	layout->addWidget(make_separator(this));
+
 	playlist_ = new QTreeWidget(this);
 	playlist_->setColumnCount(3);
-	playlist_->setHeaderHidden(true);
+	playlist_->setHeaderLabels({QString(), tr("#"), tr("File")});
+	playlist_->setHeaderHidden(false);
 	playlist_->setRootIsDecorated(true);
 	playlist_->setSelectionMode(QAbstractItemView::SingleSelection);
 	playlist_->setTextElideMode(Qt::ElideMiddle);
 	playlist_->setUniformRowHeights(true);
-	playlist_->header()->setStretchLastSection(true);
+	playlist_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	playlist_->setIndentation(16);
+	playlist_->header()->setStretchLastSection(false);
 	playlist_->header()->setSectionResizeMode(0, QHeaderView::Fixed);
 	playlist_->header()->setSectionResizeMode(1, QHeaderView::Fixed);
-	playlist_->setColumnWidth(0, 20);
-	playlist_->setColumnWidth(1, 42);
+	playlist_->header()->setSectionResizeMode(2, QHeaderView::Stretch);
+	playlist_->setColumnWidth(0, 24);
+	playlist_->setColumnWidth(1, 44);
 	layout->addWidget(playlist_, 1);
 
-	auto *button_layout = new QHBoxLayout;
-	button_layout->addStretch();
+	layout->addWidget(make_section_label(tr("Selected"), this, false));
+	selected_value_ = new ElidedFileLabel(this);
+	layout->addWidget(selected_value_);
 	play_button_ = new QPushButton(tr("Play Selected"), this);
+	play_button_->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+	play_button_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+	play_button_->setMinimumHeight(play_button_->sizeHint().height() + 6);
 	play_button_->setEnabled(false);
-	button_layout->addWidget(play_button_);
-	layout->addLayout(button_layout);
+	layout->addWidget(play_button_);
+
+	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
+	follow_program_action_->setCheckable(true);
+	configure_follow_context_menu(this, source_header, follow_program_action_);
+	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
+		follow_program_ = enabled;
+		follow_status_->setVisible(enabled);
+		if (enabled) {
+			if (apply_program_follow())
+				refresh_playlist();
+		} else {
+			set_program_scene_event_connections(program_scene_uuids_, {}, program_scene_event, this);
+		}
+	});
 
 	connect(source_selector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
 		selected_source_uuid_ = index >= 0 ? source_selector_->itemData(index).toString() : QString();
@@ -532,6 +810,7 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 
 PlaylistControlDock::~PlaylistControlDock()
 {
+	set_program_scene_event_connections(program_scene_uuids_, {}, program_scene_event, this);
 	mps_playlist_change_remove_listener(playback_changed, this);
 	obs_frontend_remove_event_callback(frontend_event, this);
 	disconnect_obs_events(source_event, this);
@@ -548,10 +827,19 @@ void PlaylistControlDock::source_event(void *data, calldata_t *calldata)
 	static_cast<PlaylistControlDock *>(data)->schedule_refresh();
 }
 
+void PlaylistControlDock::program_scene_event(void *data, calldata_t *calldata)
+{
+	(void)calldata;
+	static_cast<PlaylistControlDock *>(data)->schedule_program_refresh();
+}
+
 void PlaylistControlDock::frontend_event(enum obs_frontend_event event, void *data)
 {
+	auto *dock = static_cast<PlaylistControlDock *>(data);
 	if (needs_source_refresh(event))
-		static_cast<PlaylistControlDock *>(data)->schedule_refresh();
+		dock->schedule_refresh();
+	else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED)
+		dock->schedule_program_refresh();
 }
 
 void PlaylistControlDock::schedule_refresh()
@@ -599,6 +887,45 @@ void PlaylistControlDock::schedule_playback_refresh(const char *source_uuid)
 		Qt::QueuedConnection);
 }
 
+void PlaylistControlDock::schedule_program_refresh()
+{
+	if (!follow_program_ || program_refresh_queued_.exchange(true))
+		return;
+	QMetaObject::invokeMethod(
+		this,
+		[this] {
+			program_refresh_queued_.store(false);
+			if (apply_program_follow())
+				refresh_playlist();
+		},
+		Qt::QueuedConnection);
+}
+
+bool PlaylistControlDock::apply_program_follow()
+{
+	if (!follow_program_)
+		return false;
+	const ProgramSourceTraversal program = enumerate_program_sources();
+	set_program_scene_event_connections(program_scene_uuids_, program.scene_uuids, program_scene_event, this);
+	const QSet<QString> &active_sources = program.source_uuids;
+	follow_status_->setText(follow_status_text(static_cast<std::size_t>(active_sources.size())));
+	if (active_sources.size() != 1)
+		return false;
+
+	const QString source_uuid = *active_sources.cbegin();
+	if (source_uuid == selected_source_uuid_)
+		return false;
+	const int index = source_selector_->findData(source_uuid);
+	if (index < 0)
+		return false;
+	const QSignalBlocker blocker(source_selector_);
+	source_selector_->setCurrentIndex(index);
+	selected_source_uuid_ = source_uuid;
+	selection_valid_ = false;
+	selected_stable_id_.clear();
+	return true;
+}
+
 void PlaylistControlDock::refresh_sources()
 {
 	const QVector<SourceInfo> sources = enumerate_mps_sources();
@@ -620,6 +947,8 @@ void PlaylistControlDock::refresh_sources()
 		else
 			selected_source_uuid_.clear();
 	}
+	if (follow_program_)
+		apply_program_follow();
 	refresh_playlist();
 }
 
@@ -684,6 +1013,10 @@ void PlaylistControlDock::refresh_playlist()
 		item->setText(1, number);
 		item->setText(2, filename_from_entry(entry));
 		item->setToolTip(2, QString::fromUtf8(entry.path ? entry.path : ""));
+		item->setTextAlignment(0, Qt::AlignCenter);
+		item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+		item->setTextAlignment(2, Qt::AlignLeft | Qt::AlignVCenter);
+		item->setData(0, kPathRole, QString::fromUtf8(entry.path ? entry.path : ""));
 		if (entry.stable_id)
 			item->setData(0, kStableIdRole, QString::fromUtf8(entry.stable_id));
 		if (!entry.is_folder) {
@@ -691,7 +1024,7 @@ void PlaylistControlDock::refresh_playlist()
 			item->setData(0, kFolderItemIndexRole,
 				      QVariant::fromValue<qulonglong>(entry.folder_item_index));
 		}
-		if (entry.is_current) {
+		if (entry.is_current || entry.is_folder) {
 			QFont font = item->font(2);
 			font.setBold(true);
 			item->setFont(2, font);
@@ -716,6 +1049,9 @@ void PlaylistControlDock::refresh_playlist()
 void PlaylistControlDock::update_play_button()
 {
 	play_button_->setEnabled(selection_valid_ && !selected_source_uuid_.isEmpty());
+	QTreeWidgetItem *item = selection_valid_ ? playlist_->currentItem() : nullptr;
+	const QByteArray selected_path = item ? item->data(0, kPathRole).toString().toUtf8() : QByteArray();
+	selected_value_->setFilePath(selected_path.isEmpty() ? nullptr : selected_path.constData());
 }
 
 void PlaylistControlDock::play_selected()

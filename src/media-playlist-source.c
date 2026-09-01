@@ -374,6 +374,31 @@ bool mps_playlist_timing_get(obs_source_t *source, int64_t *time_ms, int64_t *du
 	return true;
 }
 
+bool mps_playlist_standby_duration_get(obs_source_t *source, const char *expected_path, int64_t *duration_ms)
+{
+	struct media_playlist_source *mps;
+	obs_source_t *standby_source = NULL;
+
+	if (!source || !expected_path || !duration_ms)
+		return false;
+	mps = mps_registry_lookup(source);
+	if (!mps)
+		return false;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	struct media_source_slot *standby = mps->standby_slot;
+	if (standby && standby->source && !standby->failed && standby->path &&
+	    strcmp(standby->path, expected_path) == 0)
+		standby_source = obs_source_get_ref(standby->source);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (!standby_source)
+		return false;
+
+	*duration_ms = obs_source_media_get_duration(standby_source);
+	obs_source_release(standby_source);
+	return *duration_ms > 0;
+}
+
 struct media_source_callback_context {
 	struct media_source_slot *slot;
 	uint64_t source_generation;
