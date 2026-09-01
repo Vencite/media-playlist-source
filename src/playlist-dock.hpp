@@ -96,7 +96,7 @@ private:
 	void play_selected();
 	void schedule_playback_refresh(const char *source_uuid);
 	void schedule_program_refresh();
-	bool apply_program_follow();
+	bool refresh_program_state();
 
 	QComboBox *source_selector_ = nullptr;
 	QLabel *follow_status_ = nullptr;

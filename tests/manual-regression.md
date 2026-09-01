@@ -101,8 +101,8 @@ between the docks is observed.
 10. Play several items and confirm Queue shows cached duration for Previous,
     canonical active duration for Now Playing, and standby duration for Up Next
     only when already safely available. Confirm unknown, URL, audio-only, and
-    non-prefetched targets show `--:--` where duration is unavailable, without
-    extra media sources, probing, or playback changes.
+    non-prefetched targets leave Up Next duration blank when unavailable,
+    without extra media sources, probing, or playback changes.
 11. Check Queue near 280-320 px, 400-500 px, and wider widths. Confirm filenames
     remain left aligned and elide with full-path tooltips, durations stay right
     aligned, separators remain coherent, and no horizontal scrollbar or large

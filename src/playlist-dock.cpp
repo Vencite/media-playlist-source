@@ -16,6 +16,7 @@
 #include <QIcon>
 #include <QLabel>
 #include <QMetaObject>
+#include <QPainter>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -293,14 +294,44 @@ QLabel *make_secondary_label(const QString &text, QWidget *parent = nullptr)
 	return label;
 }
 
+QIcon palette_icon(QWidget *widget, QStyle::StandardPixmap icon, QPalette::ColorRole role)
+{
+	const QIcon source = widget->style()->standardIcon(icon);
+	const int size = widget->style()->pixelMetric(QStyle::PM_SmallIconSize, nullptr, widget);
+	QPixmap pixmap = source.pixmap(size, size);
+	if (pixmap.isNull())
+		return source;
+
+	QPainter painter(&pixmap);
+	painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+	painter.fillRect(pixmap.rect(), widget->palette().color(role));
+	return QIcon(pixmap);
+}
+
 QLabel *make_section_icon(QStyle::StandardPixmap icon, QWidget *parent = nullptr)
 {
 	auto *label = new QLabel(parent);
 	const int size = label->fontMetrics().height();
-	label->setPixmap(label->style()->standardIcon(icon).pixmap(size, size));
+	label->setPixmap(palette_icon(label, icon, QPalette::Text).pixmap(size, size));
 	label->setAlignment(Qt::AlignCenter);
 	label->setFixedWidth(size + 4);
 	return label;
+}
+
+void update_program_source_indicators(QComboBox *selector, const QSet<QString> &active_sources)
+{
+	const QIcon active_icon = palette_icon(selector, QStyle::SP_MediaPlay, QPalette::Text);
+	for (int index = 0; index < selector->count(); index++) {
+		const bool active = active_sources.contains(selector->itemData(index).toString());
+		selector->setItemIcon(index, active ? active_icon : QIcon());
+		QFont font = selector->itemData(index, Qt::FontRole).value<QFont>();
+		if (font == QFont())
+			font = selector->font();
+		font.setBold(active);
+		selector->setItemData(index, font, Qt::FontRole);
+		selector->setItemData(index, active ? QObject::tr("Active in Program scene") : QString(),
+				      Qt::ToolTipRole);
+	}
 }
 
 QFrame *make_separator(QWidget *parent = nullptr)
@@ -543,18 +574,7 @@ bool PlaylistQueueDock::refresh_program_state()
 {
 	const ProgramSourceTraversal program = enumerate_program_sources();
 	set_program_scene_event_connections(program_scene_uuids_, program.scene_uuids, program_scene_event, this);
-	const QIcon active_icon = style()->standardIcon(QStyle::SP_MediaPlay);
-	for (int index = 0; index < source_selector_->count(); index++) {
-		const bool active = program.source_uuids.contains(source_selector_->itemData(index).toString());
-		source_selector_->setItemIcon(index, active ? active_icon : QIcon());
-		QFont font = source_selector_->itemData(index, Qt::FontRole).value<QFont>();
-		if (font == QFont())
-			font = source_selector_->font();
-		font.setBold(active);
-		source_selector_->setItemData(index, font, Qt::FontRole);
-		source_selector_->setItemData(index, active ? tr("Active in Program scene") : QString(),
-					      Qt::ToolTipRole);
-	}
+	update_program_source_indicators(source_selector_, program.source_uuids);
 	if (!follow_program_)
 		return false;
 	const QSet<QString> &active_sources = program.source_uuids;
@@ -606,7 +626,7 @@ void PlaylistQueueDock::clear_snapshot()
 	next_value_->setFilePath(nullptr);
 	previous_duration_value_->setText(QStringLiteral("--:--"));
 	current_duration_value_->setText(QStringLiteral("--:--"));
-	next_duration_value_->setText(QStringLiteral("--:--"));
+	next_duration_value_->clear();
 	current_path_.clear();
 	has_current_ = false;
 	update_progress(-1, 0);
@@ -664,7 +684,8 @@ void PlaylistQueueDock::refresh_snapshot()
 	if (standby_duration_found)
 		cache_duration(snapshot.next, standby_duration_ms);
 	previous_duration_value_->setText(format_media_duration(cached_duration(snapshot.previous)));
-	next_duration_value_->setText(format_media_duration(cached_duration(snapshot.next)));
+	const int64_t next_duration = cached_duration(snapshot.next);
+	next_duration_value_->setText(next_duration > 0 ? format_media_duration(next_duration) : QString());
 	current_path_ = QString::fromUtf8(snapshot.current ? snapshot.current : "");
 	has_current_ = snapshot.current != nullptr;
 	update_progress(timing_found ? time_ms : -1, timing_found ? duration_ms : 0);
@@ -793,7 +814,7 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	selected_value_ = new ElidedFileLabel(this);
 	layout->addWidget(selected_value_);
 	play_button_ = new QPushButton(tr("Play Selected"), this);
-	play_button_->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+	play_button_->setIcon(palette_icon(this, QStyle::SP_MediaPlay, QPalette::ButtonText));
 	play_button_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 	play_button_->setMinimumHeight(play_button_->sizeHint().height() + 6);
 	play_button_->setEnabled(false);
@@ -806,10 +827,10 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 		follow_program_ = enabled;
 		follow_status_->setVisible(enabled);
 		if (enabled) {
-			if (apply_program_follow())
+			if (refresh_program_state())
 				refresh_playlist();
 		} else {
-			set_program_scene_event_connections(program_scene_uuids_, {}, program_scene_event, this);
+			refresh_program_state();
 		}
 	});
 
@@ -919,24 +940,25 @@ void PlaylistControlDock::schedule_playback_refresh(const char *source_uuid)
 
 void PlaylistControlDock::schedule_program_refresh()
 {
-	if (!follow_program_ || program_refresh_queued_.exchange(true))
+	if (program_refresh_queued_.exchange(true))
 		return;
 	QMetaObject::invokeMethod(
 		this,
 		[this] {
 			program_refresh_queued_.store(false);
-			if (apply_program_follow())
+			if (refresh_program_state())
 				refresh_playlist();
 		},
 		Qt::QueuedConnection);
 }
 
-bool PlaylistControlDock::apply_program_follow()
+bool PlaylistControlDock::refresh_program_state()
 {
-	if (!follow_program_)
-		return false;
 	const ProgramSourceTraversal program = enumerate_program_sources();
 	set_program_scene_event_connections(program_scene_uuids_, program.scene_uuids, program_scene_event, this);
+	update_program_source_indicators(source_selector_, program.source_uuids);
+	if (!follow_program_)
+		return false;
 	const QSet<QString> &active_sources = program.source_uuids;
 	follow_status_->setText(follow_status_text(static_cast<std::size_t>(active_sources.size())));
 	if (active_sources.size() != 1)
@@ -977,8 +999,7 @@ void PlaylistControlDock::refresh_sources()
 		else
 			selected_source_uuid_.clear();
 	}
-	if (follow_program_)
-		apply_program_follow();
+	refresh_program_state();
 	refresh_playlist();
 }
 
@@ -1043,6 +1064,8 @@ void PlaylistControlDock::refresh_playlist()
 		item->setText(1, number);
 		item->setText(2, filename_from_entry(entry));
 		item->setToolTip(2, QString::fromUtf8(entry.path ? entry.path : ""));
+		if (entry.is_folder)
+			item->setIcon(2, palette_icon(this, QStyle::SP_DirIcon, QPalette::Text));
 		item->setTextAlignment(0, Qt::AlignCenter);
 		item->setTextAlignment(1, Qt::AlignCenter);
 		item->setTextAlignment(2, Qt::AlignLeft | Qt::AlignVCenter);
