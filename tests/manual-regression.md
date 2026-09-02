@@ -28,6 +28,118 @@ Expected: there is no full-volume burst during either transition, and the
 parent gain remains effective for the entire transition. With the parent muted,
 the output remains silent throughout. Monitoring and encoded output must agree.
 
+## Playlist Queue and Playlist Control dock lifecycle
+
+With the plugin built with the frontend and Qt options enabled:
+
+1. Open OBS's **Docks** menu and enable **Playlist Queue** and
+   **Playlist Control**.
+2. Create two Media Playlist Source instances with different names and
+   playlists; confirm both appear in each dock's selector.
+3. In **Playlist Queue**, verify the separated **Previous**, **Now Playing**,
+   and **Up Next** sections show actual filenames, including a folder child.
+   Confirm long names are elided in the dock and the full path is available in
+   the tooltip.
+4. In **Playlist Queue**, verify progress, elapsed/duration, and remaining
+   time for normal video, audio-only media, short files, and media with
+   unknown duration. Confirm filenames reset to `—` and timing resets to
+   `--:--` when no media is active.
+5. Use sequential and shuffle playback, with loop both enabled and disabled;
+   press **Next**, **Previous**, manually select an item, restart, stop, and
+   activate/deactivate the source. Confirm Queue's **Up Next** is the actual
+   canonical target and opening, closing, refreshing, or timing updates do not
+   change shuffle order.
+6. In **Playlist Control**, verify standalone files and expanded folder
+   children are listed with their configured order and canonical item indices.
+   Folder rows must not be playable selections.
+7. Click a playable row and confirm that selection alone does not start media.
+   Press **Play Selected** and confirm it starts the selected standalone file or
+   folder child. Confirm the current item has the `▶`/bold indication and the
+   button is disabled with no playable selection.
+8. Switch Control between both MPS sources, enable Shuffle, and confirm the
+   list remains the configured media collection rather than being presented as
+   the future shuffle queue. Preserve a manually inspected row and scroll
+   position while playback changes.
+9. Rename the selected source and confirm each selector label updates while
+   its selected UUID and displayed state remain unchanged. Remove the selected
+   source from the scene collection, then destroy it and create another Media
+   Playlist Source.
+10. Bind Queue to MPS A and Control to MPS B. Change playback in both sources
+    and confirm notifications update only the corresponding selected state.
+
+Expected: both independent docks follow only their own selected source, clear
+their selectors and content when that source disappears, and remain safe during
+source rename, removal, scene-collection changes, and OBS shutdown. No crash,
+stale source pointer, accidental playback on row click, or cross-contamination
+between the docks is observed.
+
+## Playlist dock Program follow, duration, and layout
+
+1. Leave **Follow Program MPS** disabled in both docks and confirm both source
+   selectors retain their existing independent manual behavior.
+2. Enable **Follow Program MPS** from each dock's background or Source-area
+   context menu. Confirm the visible status reads **Program** when the Program
+   scene contains exactly one visible MPS and that each dock selects it.
+3. In Studio Mode, put MPS A in Preview and MPS B in Program. Confirm both
+   following docks select B and never follow Preview.
+4. Switch Program to a scene with no visible MPS. Confirm the status reads
+   **No active MPS** and the previous/manual source selection is retained.
+5. Put two visible MPS sources in Program. Confirm the status reads
+   **2 active MPS**, an already active selected MPS remains selected, and a
+   non-active selected source is not replaced by an arbitrary candidate.
+6. Manually select one of multiple active MPS sources while Follow remains on,
+   then switch to a Program scene containing exactly one MPS. Confirm the manual
+   choice is accepted first and the later unambiguous scene is followed.
+7. Repeat with an MPS inside a nested scene, a group, and nested combinations.
+   Hide each ancestor item in turn and confirm the contained MPS is excluded.
+8. Reference the same MPS more than once in Program and confirm it is counted
+   once. Exercise scene graphs that reference one another and confirm traversal
+   remains bounded and OBS stays responsive.
+9. Keep Queue following MPS A while Control is manually bound to MPS B, then
+   enable Follow independently in Control. Confirm the two settings and displays
+   never cross-contaminate.
+10. Play several items and confirm Queue shows cached duration for Previous,
+    canonical active duration for Now Playing, and standby duration for Up Next
+    only when already safely available. Confirm unknown, URL, audio-only, and
+    non-prefetched targets leave Up Next duration blank when unavailable,
+    without extra media sources, probing, or playback changes.
+11. Check Queue near 280-320 px, 400-500 px, and wider widths. Confirm filenames
+    remain left aligned and elide with full-path tooltips, durations stay right
+    aligned, separators remain coherent, and no horizontal scrollbar or large
+    minimum width appears.
+12. Check Control at the same widths with standalone and folder-child entries.
+    Confirm marker, number, and filename columns align; current and selected rows
+    remain distinct; **Shuffle ON** is compact; and the full-width native
+    **Play Selected** button is usable.
+13. Confirm selecting a Control row never starts playback. Confirm the Selected
+    filename elides with a full-path tooltip and stable-ID selection still
+    survives reorder or clears when removed.
+14. Repeat the dock layout checks under available OBS light and dark themes.
+    Confirm native palette text, separators, progress bar, tree selection, and
+    play icon remain legible without fixed theme colors.
+
+## Final playlist dock polish checks
+
+A. Enable Queue Follow on MPS A, then manually choose MPS B. Confirm Queue
+   remains on B, Follow is unchecked, and the Program status is hidden. Queue
+   may retain its lightweight graph listener for source-dropdown markers;
+   Control should release its Follow-only scene listeners. Repeat independently
+   in Control.
+B. With Follow disabled, put MPS A and MPS C visibly in Program. Confirm both
+   entries have the native play indicator and emphasized text in Queue's source
+   dropdown, while no source is selected automatically. With Follow enabled and
+   two active sources, confirm both remain marked and no arbitrary source is
+   selected.
+C. Verify Control's marker column is centered, `#` and all numbers including
+   `1.1`/`1.2` are centered, and `File` plus filenames are left aligned for
+   standalone and folder-child rows.
+D. Under dark and any available light OBS theme, confirm Previous, Current, and
+   Up Next durations (including `--:--`) remain readable without overpowering
+   filenames.
+E. Resize both docks to approximately 280-320 px, 400-500 px, and a wide or
+   floating layout. Confirm icons, header padding, filenames, duration values,
+   and Play Selected remain usable without clipping or a new horizontal bar.
+
 ## Playlist lifecycle regression matrix
 
 Use a local-video playlist with audio containing `A`, `B`, and `C`, and run the

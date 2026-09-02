@@ -17,6 +17,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "media-playlist-source.h"
+#include "playlist-context.h"
+#include "playlist-dock.h"
 
 #define S_PLAYLIST "playlist"
 #define S_LOOP "loop"
@@ -71,8 +73,331 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_PLAYLIST_NEXT T_("Next")
 #define T_PLAYLIST_PREV T_("Previous")
 
+struct mps_registry_entry {
+	obs_source_t *source;
+	struct media_playlist_source *mps;
+};
+
+struct mps_change_listener {
+	mps_playlist_change_callback_t callback;
+	void *data;
+	size_t references;
+	size_t active_callbacks;
+	bool removed;
+};
+
+static DARRAY(struct mps_registry_entry) mps_registry;
+static DARRAY(struct mps_change_listener *) mps_change_listeners;
+static pthread_mutex_t mps_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mps_change_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t mps_change_condition = PTHREAD_COND_INITIALIZER;
+
+struct mps_change_callback_frame {
+	struct mps_change_listener *listener;
+	struct mps_change_callback_frame *previous;
+};
+
+static _Thread_local struct mps_change_callback_frame *mps_change_callback_frame;
+
 static bool playlist_has_next(struct media_playlist_source *mps);
 static bool playlist_has_previous(struct media_playlist_source *mps);
+static void prepare_next_media(struct media_playlist_source *mps);
+
+static void mps_playlist_change_notify(struct media_playlist_source *mps)
+{
+	char *source_uuid = NULL;
+	DARRAY(struct mps_change_listener *) listeners;
+	da_init(listeners);
+
+	pthread_mutex_lock(&mps_registry_mutex);
+	for (size_t i = 0; i < mps_registry.num; i++) {
+		if (mps_registry.array[i].mps == mps) {
+			if (mps->source_uuid)
+				source_uuid = bstrdup(mps->source_uuid);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&mps_registry_mutex);
+	if (!source_uuid) {
+		da_free(listeners);
+		return;
+	}
+
+	pthread_mutex_lock(&mps_change_mutex);
+	for (size_t i = 0; i < mps_change_listeners.num; i++) {
+		struct mps_change_listener *listener = mps_change_listeners.array[i];
+		if (listener->removed)
+			continue;
+		++listener->references;
+		da_push_back(listeners, &listener);
+	}
+	pthread_mutex_unlock(&mps_change_mutex);
+
+	for (size_t i = 0; i < listeners.num; i++) {
+		struct mps_change_listener *listener = listeners.array[i];
+		mps_playlist_change_callback_t callback;
+		void *data;
+
+		pthread_mutex_lock(&mps_change_mutex);
+		callback = listener->removed ? NULL : listener->callback;
+		data = listener->data;
+		if (callback)
+			++listener->active_callbacks;
+		pthread_mutex_unlock(&mps_change_mutex);
+		if (callback) {
+			struct mps_change_callback_frame frame = {
+				.listener = listener,
+				.previous = mps_change_callback_frame,
+			};
+			mps_change_callback_frame = &frame;
+			callback(data, source_uuid);
+			mps_change_callback_frame = frame.previous;
+		}
+
+		pthread_mutex_lock(&mps_change_mutex);
+		if (callback)
+			--listener->active_callbacks;
+		--listener->references;
+		if (listener->removed && !listener->references)
+			bfree(listener);
+		pthread_cond_broadcast(&mps_change_condition);
+		pthread_mutex_unlock(&mps_change_mutex);
+	}
+	da_free(listeners);
+	bfree(source_uuid);
+}
+
+static bool clear_logical_next_path_locked(struct media_playlist_source *mps)
+{
+	bool changed = mps->logical_next_path != NULL;
+	bfree(mps->logical_next_path);
+	mps->logical_next_path = NULL;
+	return changed;
+}
+
+static bool invalidate_logical_next_path(struct media_playlist_source *mps)
+{
+	bool changed;
+	pthread_mutex_lock(&mps->mutex);
+	changed = clear_logical_next_path_locked(mps);
+	pthread_mutex_unlock(&mps->mutex);
+	if (changed)
+		mps_playlist_change_notify(mps);
+	return changed;
+}
+
+void mps_playlist_change_add_listener(mps_playlist_change_callback_t callback, void *data)
+{
+	struct mps_change_listener *listener;
+
+	if (!callback)
+		return;
+
+	listener = bzalloc(sizeof(*listener));
+	if (!listener)
+		return;
+	listener->callback = callback;
+	listener->data = data;
+
+	pthread_mutex_lock(&mps_change_mutex);
+	for (size_t i = 0; i < mps_change_listeners.num; i++) {
+		if (mps_change_listeners.array[i]->callback == callback &&
+		    mps_change_listeners.array[i]->data == data) {
+			pthread_mutex_unlock(&mps_change_mutex);
+			bfree(listener);
+			return;
+		}
+	}
+	da_push_back(mps_change_listeners, &listener);
+	pthread_mutex_unlock(&mps_change_mutex);
+}
+
+void mps_playlist_change_remove_listener(mps_playlist_change_callback_t callback, void *data)
+{
+	struct mps_change_listener *listener = NULL;
+	size_t current_thread_callbacks = 0;
+
+	pthread_mutex_lock(&mps_change_mutex);
+	for (size_t i = 0; i < mps_change_listeners.num; i++) {
+		if (mps_change_listeners.array[i]->callback == callback &&
+		    mps_change_listeners.array[i]->data == data) {
+			listener = mps_change_listeners.array[i];
+			da_erase(mps_change_listeners, i);
+			break;
+		}
+	}
+	if (listener) {
+		++listener->references;
+		listener->removed = true;
+		for (struct mps_change_callback_frame *frame = mps_change_callback_frame; frame;
+		     frame = frame->previous) {
+			if (frame->listener == listener)
+				++current_thread_callbacks;
+		}
+		while (listener->active_callbacks > current_thread_callbacks)
+			pthread_cond_wait(&mps_change_condition, &mps_change_mutex);
+		--listener->references;
+		if (!listener->references)
+			bfree(listener);
+	}
+	pthread_mutex_unlock(&mps_change_mutex);
+}
+
+static void mps_registry_add(struct media_playlist_source *mps)
+{
+	struct mps_registry_entry entry = {mps->source, mps};
+	pthread_mutex_lock(&mps_registry_mutex);
+	da_push_back(mps_registry, &entry);
+	pthread_mutex_unlock(&mps_registry_mutex);
+}
+
+static void mps_registry_remove(struct media_playlist_source *mps)
+{
+	pthread_mutex_lock(&mps_registry_mutex);
+	for (size_t i = 0; i < mps_registry.num; i++) {
+		if (mps_registry.array[i].mps == mps) {
+			da_erase(mps_registry, i);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&mps_registry_mutex);
+}
+
+static char *copy_media_path(const struct media_file_data *media)
+{
+	return media && media->path ? bstrdup(media->path) : NULL;
+}
+
+static struct media_playlist_source *mps_registry_lookup(obs_source_t *source)
+{
+	struct media_playlist_source *mps = NULL;
+
+	pthread_mutex_lock(&mps_registry_mutex);
+	for (size_t i = 0; i < mps_registry.num; i++) {
+		if (mps_registry.array[i].source == source) {
+			mps = mps_registry.array[i].mps;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&mps_registry_mutex);
+	return mps;
+}
+
+bool mps_playlist_context_snapshot_get(obs_source_t *source, struct mps_playlist_context_snapshot *snapshot)
+{
+	struct media_playlist_source *mps;
+
+	if (!source || !snapshot)
+		return false;
+	*snapshot = (struct mps_playlist_context_snapshot){0};
+
+	mps = mps_registry_lookup(source);
+	if (!mps)
+		return false;
+
+	pthread_mutex_lock(&mps->mutex);
+	struct mps_playlist_context_input input = {
+		.files = &mps->files.da,
+		.shuffler = &mps->shuffler,
+		.shuffle = mps->shuffle,
+		.loop = mps->loop,
+		.current_media = mps->current_media,
+		.actual_media = mps->actual_media,
+		.current_media_index = mps->current_media_index,
+		.current_folder_item_index = mps->current_folder_item_index,
+		.logical_next_path = mps->logical_next_path,
+	};
+	struct mps_playlist_context context;
+	mps_playlist_context_resolve(&input, &context);
+	snapshot->previous = copy_media_path(context.previous);
+	snapshot->current = copy_media_path(context.current);
+	snapshot->next = context.next_path ? bstrdup(context.next_path) : NULL;
+	snapshot->shuffle = mps->shuffle;
+	bool strings_copied = (!context.previous || snapshot->previous) && (!context.current || snapshot->current) &&
+			      (!context.next_path || snapshot->next);
+	pthread_mutex_unlock(&mps->mutex);
+	if (!strings_copied) {
+		mps_playlist_context_snapshot_free(snapshot);
+		return false;
+	}
+	return true;
+}
+
+void mps_playlist_context_snapshot_free(struct mps_playlist_context_snapshot *snapshot)
+{
+	if (!snapshot)
+		return;
+	bfree(snapshot->previous);
+	bfree(snapshot->current);
+	bfree(snapshot->next);
+	*snapshot = (struct mps_playlist_context_snapshot){0};
+}
+
+bool mps_playlist_entries_snapshot_get(obs_source_t *source, struct mps_playlist_entries_snapshot *snapshot)
+{
+	struct media_playlist_source *mps;
+	bool copied;
+
+	if (!source || !snapshot)
+		return false;
+	*snapshot = (struct mps_playlist_entries_snapshot){0};
+
+	mps = mps_registry_lookup(source);
+	if (!mps)
+		return false;
+
+	pthread_mutex_lock(&mps->mutex);
+	snapshot->shuffle = mps->shuffle;
+	copied = mps_playlist_entries_copy(&mps->files.da, mps->actual_media, &snapshot->items, &snapshot->item_count);
+	pthread_mutex_unlock(&mps->mutex);
+	if (!copied) {
+		mps_playlist_entries_snapshot_free(snapshot);
+		return false;
+	}
+	return true;
+}
+
+void mps_playlist_entries_snapshot_free(struct mps_playlist_entries_snapshot *snapshot)
+{
+	if (!snapshot)
+		return;
+	mps_playlist_entries_free(snapshot->items, snapshot->item_count);
+	*snapshot = (struct mps_playlist_entries_snapshot){0};
+}
+
+bool mps_playlist_timing_get(obs_source_t *source, int64_t *time_ms, int64_t *duration_ms)
+{
+	if (!source || !time_ms || !duration_ms || !mps_registry_lookup(source))
+		return false;
+	*time_ms = obs_source_media_get_time(source);
+	*duration_ms = obs_source_media_get_duration(source);
+	return true;
+}
+
+bool mps_playlist_standby_duration_get(obs_source_t *source, const char *expected_path, int64_t *duration_ms)
+{
+	struct media_playlist_source *mps;
+	obs_source_t *standby_source = NULL;
+
+	if (!source || !expected_path || !duration_ms)
+		return false;
+	mps = mps_registry_lookup(source);
+	if (!mps)
+		return false;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	struct media_source_slot *standby = mps->standby_slot;
+	if (standby && standby->source && !standby->failed && standby->path &&
+	    strcmp(standby->path, expected_path) == 0)
+		standby_source = obs_source_get_ref(standby->source);
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (!standby_source)
+		return false;
+
+	*duration_ms = obs_source_media_get_duration(standby_source);
+	obs_source_release(standby_source);
+	return *duration_ms > 0;
+}
 
 struct media_source_callback_context {
 	struct media_source_slot *slot;
@@ -651,6 +976,7 @@ static void request_media_switch(struct media_playlist_source *mps, enum mps_swi
 static void select_index_proc_(struct media_playlist_source *mps, size_t media_index, size_t folder_item_index)
 {
 	if (media_index < mps->files.num) {
+		invalidate_logical_next_path(mps);
 		obs_source_t *active_source = get_active_source_ref(mps);
 		if (active_source) {
 			obs_source_media_play_pause(active_source, true);
@@ -669,6 +995,7 @@ static void select_index_proc_(struct media_playlist_source *mps, size_t media_i
 			pthread_mutex_unlock(&mps->lifecycle_mutex);
 		}
 		pthread_mutex_unlock(&mps->mutex);
+		mps_playlist_change_notify(mps);
 	}
 }
 
@@ -764,8 +1091,12 @@ static void mps_end_reached(void *data)
 	struct media_playlist_source *mps = data;
 	set_media_state(mps, OBS_MEDIA_STATE_ENDED);
 	obs_source_media_ended(mps->source);
+	invalidate_logical_next_path(mps);
+	pthread_mutex_lock(&mps->mutex);
 	set_current_media_index(mps, 0);
+	pthread_mutex_unlock(&mps->mutex);
 	obs_source_save(mps->source);
+	mps_playlist_change_notify(mps);
 }
 
 static void media_source_ended(void *data, calldata_t *cd)
@@ -1020,14 +1351,37 @@ static void mps_restart(void *data)
 
 	if (restart_current && cancel_pending_transition(mps, false, true))
 		restore_active_playlist_position(mps);
+	invalidate_logical_next_path(mps);
 
 	if (mps->restart_behavior == RESTART_BEHAVIOR_FIRST_FILE) {
-		play_media_at_index(mps, 0, false);
+		bool clear_source;
+		bool empty_folder;
+
+		pthread_mutex_lock(&mps->mutex);
+		set_current_media_index(mps, 0);
+		clear_source = !mps->current_media || !mps->actual_media;
+		empty_folder = !clear_source && mps->current_media->is_folder && !mps->current_media->folder_items.num;
+		if (!clear_source && !empty_folder) {
+			if (mps->current_media->is_folder)
+				set_current_folder_item_index(mps, 0);
+			else
+				update_media_source(mps, true);
+		}
+		pthread_mutex_unlock(&mps->mutex);
+		if (clear_source)
+			clear_media_source(mps);
+		else if (empty_folder)
+			obs_source_media_next(mps->source);
+		else
+			obs_source_save(mps->source);
 		request_media_switch(mps, MPS_SWITCH_NEXT, false);
 	} else if (mps->restart_behavior == RESTART_BEHAVIOR_CURRENT_FILE) {
 		if (mps->state == OBS_MEDIA_STATE_ENDED) {
+			pthread_mutex_lock(&mps->mutex);
 			update_media_source(mps, true);
+			pthread_mutex_unlock(&mps->mutex);
 			request_media_switch(mps, MPS_SWITCH_NEXT, false);
+			mps_playlist_change_notify(mps);
 			return;
 		}
 		source = get_active_source_ref(mps);
@@ -1044,6 +1398,8 @@ static void mps_restart(void *data)
 		}
 		set_media_state(mps, OBS_MEDIA_STATE_PLAYING);
 	}
+	prepare_next_media(mps);
+	mps_playlist_change_notify(mps);
 }
 
 static void mps_stop(void *data)
@@ -1053,6 +1409,7 @@ static void mps_stop(void *data)
 
 	if (cancel_pending_transition(mps, false, false))
 		restore_active_playlist_position(mps);
+	invalidate_logical_next_path(mps);
 	source = get_active_source_ref(mps);
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
@@ -1069,6 +1426,7 @@ static void mps_stop(void *data)
 		obs_source_release(source);
 	}
 	set_media_state(mps, OBS_MEDIA_STATE_STOPPED);
+	mps_playlist_change_notify(mps);
 }
 
 static void mps_playlist_next(void *data)
@@ -1076,13 +1434,17 @@ static void mps_playlist_next(void *data)
 	struct media_playlist_source *mps = data;
 	bool last_folder_item_reached = false;
 	bool switched = false;
+	bool next_invalidated;
 	bool automatic;
 	bool retrying;
 
+	pthread_mutex_lock(&mps->mutex);
+	next_invalidated = clear_logical_next_path_locked(mps);
+	pthread_mutex_unlock(&mps->mutex);
 	if (!get_total_file_count(mps))
-		return;
+		goto notify;
 	if (!playlist_has_next(mps))
-		return;
+		goto notify;
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	automatic = mps->automatic_next_pending;
@@ -1155,6 +1517,11 @@ end:
 		pthread_mutex_unlock(&mps->lifecycle_mutex);
 	}
 	pthread_mutex_unlock(&mps->mutex);
+
+notify:
+	if (switched || next_invalidated)
+		mps_playlist_change_notify(mps);
+	return;
 }
 
 static void mps_playlist_prev(void *data)
@@ -1162,12 +1529,16 @@ static void mps_playlist_prev(void *data)
 	struct media_playlist_source *mps = data;
 	bool is_first_folder_item = false;
 	bool switched = false;
+	bool next_invalidated;
 	bool retrying;
 
+	pthread_mutex_lock(&mps->mutex);
+	next_invalidated = clear_logical_next_path_locked(mps);
+	pthread_mutex_unlock(&mps->mutex);
 	if (!get_total_file_count(mps))
-		return;
+		goto notify;
 	if (!playlist_has_previous(mps))
-		return;
+		goto notify;
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	retrying = mps->retrying_switch;
@@ -1236,6 +1607,10 @@ end:
 		pthread_mutex_unlock(&mps->lifecycle_mutex);
 	}
 	pthread_mutex_unlock(&mps->mutex);
+
+notify:
+	if (switched || next_invalidated)
+		mps_playlist_change_notify(mps);
 }
 
 static void mps_activate(void *data)
@@ -1281,6 +1656,7 @@ static void mps_destroy(void *data)
 	if (!mps)
 		return;
 
+	mps_registry_remove(mps);
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	mps->destroying = true;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
@@ -1293,6 +1669,8 @@ static void mps_destroy(void *data)
 	destroy_media_slot(&mps->media_slots[1]);
 	shuffler_destroy(&mps->shuffler);
 	free_files(&mps->files.da);
+	bfree(mps->logical_next_path);
+	bfree(mps->source_uuid);
 	pthread_mutex_destroy(&mps->mutex);
 	pthread_mutex_destroy(&mps->audio_mutex);
 	pthread_mutex_destroy(&mps->lifecycle_mutex);
@@ -1303,11 +1681,13 @@ static void mps_destroy(void *data)
 static void *mps_create(obs_data_t *settings, obs_source_t *source)
 {
 	UNUSED_PARAMETER(settings);
+	const char *source_uuid = obs_source_get_uuid(source);
 
 	struct media_playlist_source *mps = bzalloc(sizeof(*mps));
 
 	mps->first_update = true;
 	mps->source = source;
+	mps->source_uuid = source_uuid ? bstrdup(source_uuid) : NULL;
 	pthread_mutex_init_value(&mps->mutex);
 	pthread_mutex_init_value(&mps->audio_mutex);
 	pthread_mutex_init_value(&mps->lifecycle_mutex);
@@ -1345,6 +1725,7 @@ static void *mps_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void select_index(int media_index, int folder_item_index)", select_index_proc, mps);
 
 	obs_source_update(source, NULL);
+	mps_registry_add(mps);
 	return mps;
 
 mutex_error:
@@ -1352,6 +1733,7 @@ mutex_error:
 audio_mutex_error:
 	pthread_mutex_destroy(&mps->lifecycle_mutex);
 allocation_error:
+	bfree(mps->source_uuid);
 	bfree(mps);
 	return NULL;
 }
@@ -1441,34 +1823,15 @@ static bool copy_current_target(struct media_playlist_source *mps, struct media_
 
 static struct media_file_data *next_sequential_media(struct media_playlist_source *mps)
 {
-	if (mps->current_media && mps->current_media->is_folder &&
-	    mps->current_folder_item_index + 1 < mps->current_media->folder_items.num)
-		return &mps->current_media->folder_items.array[mps->current_folder_item_index + 1];
-
-	if (!mps->files.num)
-		return NULL;
-
-	for (size_t offset = 1; offset <= mps->files.num; offset++) {
-		size_t index = mps->current_media_index + offset;
-		if (index >= mps->files.num) {
-			if (!mps->loop)
-				return NULL;
-			index %= mps->files.num;
-		}
-
-		struct media_file_data *media = &mps->files.array[index];
-		if (!media->is_folder)
-			return media;
-		if (media->folder_items.num)
-			return &media->folder_items.array[0];
-	}
-	return NULL;
+	return mps_next_sequential_media(&mps->files.da, mps->current_media, mps->current_media_index,
+					 mps->current_folder_item_index, mps->loop);
 }
 
 static bool copy_next_target(struct media_playlist_source *mps, struct media_target *target)
 {
 	struct media_file_data *media = NULL;
 	bool copied = false;
+	bool next_changed;
 
 	pthread_mutex_lock(&mps->mutex);
 	if (mps->shuffle) {
@@ -1479,7 +1842,18 @@ static bool copy_next_target(struct media_playlist_source *mps, struct media_tar
 	}
 	if (media)
 		copied = copy_media_target(media, target);
+	char *next_path = media && media->path ? bstrdup(media->path) : NULL;
+	next_changed = (mps->logical_next_path || next_path) &&
+		       (!mps->logical_next_path || !next_path || strcmp(mps->logical_next_path, next_path) != 0);
+	if (next_changed) {
+		bfree(mps->logical_next_path);
+		mps->logical_next_path = next_path;
+	} else {
+		bfree(next_path);
+	}
 	pthread_mutex_unlock(&mps->mutex);
+	if (next_changed)
+		mps_playlist_change_notify(mps);
 	return copied;
 }
 
@@ -2321,6 +2695,7 @@ static void mps_update(void *data, obs_data_t *settings)
 	mps->resetting = true;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
 	transition_pending = cancel_pending_transition(mps, true, false);
+	invalidate_logical_next_path(mps);
 
 	mps->visibility_behavior = obs_data_get_int(settings, S_VISIBILITY_BEHAVIOR);
 	if (mps->visibility_behavior != visibility_behavior) {
@@ -2328,10 +2703,6 @@ static void mps_update(void *data, obs_data_t *settings)
 	}
 	mps->restart_behavior = obs_data_get_int(settings, S_RESTART_BEHAVIOR);
 	shuffle = obs_data_get_bool(settings, S_SHUFFLE);
-	shuffle_changed = mps->shuffle != shuffle;
-	mps->shuffle = shuffle;
-	mps->loop = obs_data_get_bool(settings, S_LOOP);
-	shuffler_set_loop(&mps->shuffler, mps->loop);
 	new_speed = obs_data_get_int(settings, S_SPEED);
 	mps->speed = new_speed;
 
@@ -2367,16 +2738,21 @@ static void mps_update(void *data, obs_data_t *settings)
 	array = obs_data_get_array(settings, S_PLAYLIST);
 	count = obs_data_array_count(array);
 
-	if (!mps->first_update && mps->current_media) {
+	bool found = false;
+	bool has_files;
+	bool empty_folder = false;
+	bool should_switch;
+	pthread_mutex_lock(&mps->mutex);
+	shuffle_changed = mps->shuffle != shuffle;
+	mps->shuffle = shuffle;
+	mps->loop = obs_data_get_bool(settings, S_LOOP);
+	shuffler_set_loop(&mps->shuffler, mps->loop);
+	if (!mps->first_update && mps->current_media)
 		old_media_path = mps->current_media->path;
-	}
 	if (mps->first_update) {
 		mps->current_media_filename = bstrdup(obs_data_get_string(settings, S_CURRENT_FOLDER_ITEM_FILENAME));
 		mps->current_media_index = obs_data_get_int(settings, S_CURRENT_MEDIA_INDEX);
 	}
-
-	bool found = false;
-	pthread_mutex_lock(&mps->mutex);
 	for (size_t i = 0; i < count; i++) {
 		obs_data_t *item = obs_data_array_item(array, i);
 		const char *path = obs_data_get_string(item, "value");
@@ -2423,13 +2799,15 @@ static void mps_update(void *data, obs_data_t *settings)
 		mps->actual_media = NULL;
 	else
 		mps->actual_media = mps->current_media;
+	has_files = get_total_file_count(mps) > 0;
 	pthread_mutex_unlock(&mps->mutex);
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	mps->prefetch_dirty = true;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
 
-	if (get_total_file_count(mps)) {
+	pthread_mutex_lock(&mps->mutex);
+	if (has_files) {
 		if (item_edited) {
 			mps->current_folder_item_index = 0;
 		} else if (mps->current_media && mps->current_media->is_folder) {
@@ -2447,7 +2825,7 @@ static void mps_update(void *data, obs_data_t *settings)
 			}
 
 			if (mps->current_media->folder_items.num == 0) {
-				mps_playlist_next(mps);
+				empty_folder = true;
 			} else {
 				set_current_folder_item_index(mps, mps->current_folder_item_index);
 				if (mps->shuffle)
@@ -2459,18 +2837,33 @@ static void mps_update(void *data, obs_data_t *settings)
 				shuffler_select(&mps->shuffler, mps->actual_media);
 		}
 
-		if (mps->first_update || !found || item_edited || transition_pending) {
-			/* Clear if last file is a folder and is empty */
-			if (mps->current_media->is_folder && mps->current_media->folder_items.num == 0) {
-				clear_media_source(mps);
-			} else {
-				update_media_source(mps, true);
-				request_media_switch(mps, MPS_SWITCH_NEXT, false);
-			}
-		}
-	} else if (!mps->first_update) {
+		should_switch = mps->first_update || !found || item_edited || transition_pending;
+	} else {
+		should_switch = false;
+	}
+	if (!has_files && !mps->first_update) {
 		bfree(mps->current_media_filename);
 		mps->current_media_filename = NULL;
+	}
+	pthread_mutex_unlock(&mps->mutex);
+
+	if (has_files) {
+		if (empty_folder)
+			mps_playlist_next(mps);
+		if (should_switch) {
+			bool clear_source;
+			pthread_mutex_lock(&mps->mutex);
+			clear_source = mps->current_media && mps->current_media->is_folder &&
+				       mps->current_media->folder_items.num == 0;
+			if (!clear_source)
+				update_media_source(mps, true);
+			pthread_mutex_unlock(&mps->mutex);
+			if (clear_source)
+				clear_media_source(mps);
+			else
+				request_media_switch(mps, MPS_SWITCH_NEXT, false);
+		}
+	} else if (!mps->first_update) {
 		clear_media_source(mps);
 	}
 	rebind_active_slot_metadata(mps);
@@ -2495,6 +2888,7 @@ static void mps_update(void *data, obs_data_t *settings)
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	mps->resetting = false;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	mps_playlist_change_notify(mps);
 }
 
 static void mps_save(void *data, obs_data_t *settings)

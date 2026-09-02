@@ -28,6 +28,9 @@ copilot-instructions.md
 .cursor/
 .graphify-out/
 .windsurf/
+.superpowers/
+/superpowers/
+/docs/superpowers/
 !buildspec.json
 !CMakeLists.txt
 !CMakePresets.json

@@ -7,18 +7,27 @@
 
 An enhanced and actively maintained OBS Studio plugin for media playlists, built on OBS Media Source. It provides playlist behavior similar to VLC Video Source while keeping playback inside OBS Media Source.
 
+<p align="center">
+  <img src="docs/images/playlist-queue.png" alt="Playlist Queue dock" width="607">
+</p>
+
+<p align="center">
+  <img src="docs/images/playlist-control.png" alt="Playlist Control dock" width="607">
+</p>
+
 ## About this fork
 
-This repository is an independently maintained fork of [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source). The original plugin and most of its original code were created by Ian Rodriguez / CodeYan01; this fork is maintained and developed by Vencite.
+This is an independently maintained fork of [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source), maintained by Vencite.
 
-The fork started from a production issue where the playlist source could briefly become transparent between consecutive files, exposing sources underneath it during a live broadcast. The fork now uses dual-source A/B playback with preloading for local video files to make consecutive playback effectively seamless.
+The fork started as a production-focused fix for visible gaps between playlist items, introducing dual-source A/B playback with preloading for seamless transitions. It also includes corrected decoder audio routing and additional reliability and workflow improvements for live OBS use.
 
-It also includes fixes developed independently from upstream, including corrected audio routing for the internal playlist decoders so the parent Media Playlist Source remains authoritative for mixer gain, mute, filters, and track routing.
-
-The upstream repository remains the home of the original project. For the upstream version, use [CodeYan01/media-playlist-source](https://github.com/CodeYan01/media-playlist-source). For bugs or feature requests affecting this fork, use the [Vencite issue tracker](https://github.com/Vencite/media-playlist-source/issues).
+The original plugin was created by Ian Rodriguez / CodeYan01.
 
 ## Features
 
+- **NEW in 0.1.5:** **Playlist Queue** dock showing Previous, Now Playing and Up Next, including duration, playback progress and Program-scene status.
+- **NEW in 0.1.5:** **Playlist Control** dock for browsing the configured playlist and safely starting any selected file or folder item.
+- **NEW in 0.1.5:** Optional **Follow Program MPS** mode for both docks, available from their right-click menus.
 - Plays playlists of local files, folders, and URLs supported by FFmpeg.
 - Allows editing the playlist without restarting playback, including reordering items.
 - Allows editing source settings without restarting the current video.
@@ -33,6 +42,7 @@ The upstream repository remains the home of the original project. For the upstre
 - Can start with either the first file or the previously current file when the source is restarted.
 - Preloads the next local video and switches between internal A/B decoders to avoid the blank or transparent frame that can otherwise appear between consecutive files.
 - Routes decoder audio through the parent Media Playlist Source so its mixer gain, mute state, filters, and OBS track routing remain authoritative.
+- Both docks are available through OBS's Docks menu and support independent **Follow Program MPS** behavior from their right-click context menus.
 
 ## Installation
 
@@ -52,12 +62,6 @@ The current build configuration targets OBS Studio 31.1.1 and the fork is tested
 - Programmatic playlist updates must preserve or provide each entry's `uuid`. OBS generates and preserves those IDs for editable-list changes made in the Properties UI; the plugin uses them to keep duplicate entries and the current item distinct. See [OBS PR #11126](https://github.com/obsproject/obs-studio/pull/11126).
 - Audio track and subtitle selection are not supported yet.
 - Folder contents are not refreshed automatically yet. Saving the source settings again refreshes them manually.
-
-## Releases
-
-Stable Vencite releases use the `vMAJOR.MINOR.PATCH-ven` tag convention. Fork prereleases append a numeric suffix, for example `vMAJOR.MINOR.PATCH-ven.1`.
-
-Release-specific validation notes are kept in [`docs/release-notes`](docs/release-notes), and the manual regression checklist is available in [`tests/manual-regression.md`](tests/manual-regression.md).
 
 ## For developers
 
@@ -83,3 +87,5 @@ If the item at `media_index` is not a folder, `folder_item_index` is ignored. Ou
 ## Development and testing
 
 Development of this fork uses AI-assisted coding tools where useful, but changes are reviewed, compiled in CI, and validated in OBS before being relied on in production.
+
+Release validation notes are kept in [docs/release-notes](docs/release-notes), and the manual regression checklist is available in [tests/manual-regression.md](tests/manual-regression.md).

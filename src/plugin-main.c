@@ -19,6 +19,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#ifdef MPS_ENABLE_PLAYLIST_DOCK
+#include "playlist-dock.h"
+#endif
+
 #ifdef TEST_SHUFFLER
 #include "shuffler.h"
 #endif
@@ -32,6 +36,9 @@ bool obs_module_load(void)
 {
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	obs_register_source(&media_playlist_source_info);
+#ifdef MPS_ENABLE_PLAYLIST_DOCK
+	mps_playlist_dock_register();
+#endif
 #ifdef TEST_SHUFFLER
 	test_shuffler();
 #endif
@@ -40,5 +47,8 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+#ifdef MPS_ENABLE_PLAYLIST_DOCK
+	mps_playlist_dock_unregister();
+#endif
 	obs_log(LOG_INFO, "plugin unloaded");
 }
