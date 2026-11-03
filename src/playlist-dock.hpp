@@ -44,7 +44,7 @@ private:
 	void refresh_snapshot();
 	void refresh_progress();
 	void clear_snapshot();
-	void update_progress(int64_t time_ms, int64_t duration_ms);
+	void update_progress(int64_t time_ms, int64_t duration_ms, int64_t remaining_ms, int64_t playlist_remaining_ms);
 	void schedule_playback_refresh(const char *source_uuid);
 	void schedule_program_refresh();
 	bool refresh_program_state();
@@ -62,6 +62,7 @@ private:
 	QProgressBar *progress_bar_ = nullptr;
 	QLabel *elapsed_value_ = nullptr;
 	QLabel *remaining_value_ = nullptr;
+	QLabel *playlist_remaining_value_ = nullptr;
 	QTimer *progress_timer_ = nullptr;
 	QAction *follow_program_action_ = nullptr;
 	QString selected_source_uuid_;
@@ -69,6 +70,7 @@ private:
 	QHash<QString, int64_t> duration_cache_;
 	QSet<QString> program_scene_uuids_;
 	bool has_current_ = false;
+	bool program_target_available_ = false;
 	std::atomic_bool follow_program_ = false;
 	std::atomic_bool refresh_queued_ = false;
 	std::atomic_bool program_refresh_queued_ = false;

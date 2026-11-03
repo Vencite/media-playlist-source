@@ -6,6 +6,9 @@
 !/build-aux
 !/cmake
 !/data
+!/docs
+/docs/*
+!/docs/playlist-telemetry.md
 !/src
 !/tests
 !.clang-format

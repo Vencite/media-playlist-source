@@ -65,6 +65,15 @@ The current build configuration targets OBS Studio 31.1.1 and the fork is tested
 
 ## For developers
 
+The development implementation of **authoritative playlist telemetry** exposes
+`GetPlaylistState` / `PlaylistStateChanged` through the optional obs-websocket
+Vendor API and adds **Playlist remaining** to Queue. See the
+[schema v1 contract](docs/playlist-telemetry.md) for request/event envelopes,
+strict unknown-value omission and known flags, speed units, current-pass
+semantics, limits, and build requirements. This work is not yet a claim of
+released-package or live-OBS verification; see the
+[remaining runtime/release checks](tests/playlist-telemetry.md).
+
 To inspect the keys stored in the source [settings](https://docs.obsproject.com/reference-sources#c.obs_source_get_settings), use [obs_data_get_json](https://docs.obsproject.com/reference-settings#c.obs_data_get_json) or inspect the scene collection JSON. The implementation is in [`src/media-playlist-source.c`](src/media-playlist-source.c).
 
 To select a file programmatically:
@@ -87,5 +96,11 @@ If the item at `media_index` is not a folder, `folder_item_index` is ignored. Ou
 ## Development and testing
 
 Development of this fork uses AI-assisted coding tools where useful, but changes are reviewed, compiled in CI, and validated in OBS before being relied on in production.
+
+Linux CI runs CTest. Vendor wire-contract tests use obs-websocket's real JSON
+converter and need the **test-only** `nlohmann-json3-dev` package on Ubuntu;
+there is no new plugin runtime dependency. Use `-DBUILD_TESTING=OFF` for a build
+without test dependencies. Duration discovery's explicit runtime benchmark is
+`duration-probe-benchmark`; see the telemetry docs before running it.
 
 Release validation notes are kept in [docs/release-notes](docs/release-notes), and the manual regression checklist is available in [tests/manual-regression.md](tests/manual-regression.md).

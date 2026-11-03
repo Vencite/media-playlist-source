@@ -36,6 +36,7 @@
 #include <callback/proc.h>
 
 #include "playlist-dock.h"
+#include "playlist-telemetry.h"
 
 static QString filename_from_path(const QString &path)
 {
@@ -436,14 +437,17 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	remaining_value_ = make_secondary_label(QStringLiteral("--:--"), this);
 	context_layout->addWidget(elapsed_value_, 6, 1);
 	context_layout->addWidget(remaining_value_, 6, 2);
-	context_layout->addWidget(make_separator(this), 7, 0, 1, 3);
+	context_layout->addWidget(make_section_label(tr("Playlist remaining"), this), 7, 1);
+	playlist_remaining_value_ = make_secondary_label(QStringLiteral("--:--"), this);
+	context_layout->addWidget(playlist_remaining_value_, 7, 2);
+	context_layout->addWidget(make_separator(this), 8, 0, 1, 3);
 
-	context_layout->addWidget(make_section_icon(QStyle::SP_MediaSkipForward, this), 8, 0);
-	context_layout->addWidget(make_section_label(tr("Up Next"), this), 8, 1);
+	context_layout->addWidget(make_section_icon(QStyle::SP_MediaSkipForward, this), 9, 0);
+	context_layout->addWidget(make_section_label(tr("Up Next"), this), 9, 1);
 	next_duration_value_ = make_secondary_label(QString(), this);
-	context_layout->addWidget(next_duration_value_, 8, 2);
+	context_layout->addWidget(next_duration_value_, 9, 2);
 	next_value_ = new ElidedFileLabel(this);
-	context_layout->addWidget(next_value_, 9, 1, 1, 2);
+	context_layout->addWidget(next_value_, 10, 1, 1, 2);
 	layout->addLayout(context_layout);
 	layout->addStretch();
 
@@ -579,15 +583,19 @@ bool PlaylistQueueDock::refresh_program_state()
 		return false;
 	const QSet<QString> &active_sources = program.source_uuids;
 	follow_status_->setText(follow_status_text(static_cast<std::size_t>(active_sources.size())));
-	if (active_sources.size() != 1)
-		return false;
+	const bool was_available = program_target_available_;
+	program_target_available_ = active_sources.size() == 1;
+	if (!program_target_available_)
+		return was_available;
 
 	const QString source_uuid = *active_sources.cbegin();
 	if (source_uuid == selected_source_uuid_)
-		return false;
+		return !was_available;
 	const int index = source_selector_->findData(source_uuid);
-	if (index < 0)
-		return false;
+	if (index < 0) {
+		program_target_available_ = false;
+		return was_available;
+	}
 	const QSignalBlocker blocker(source_selector_);
 	source_selector_->setCurrentIndex(index);
 	selected_source_uuid_ = source_uuid;
@@ -629,7 +637,7 @@ void PlaylistQueueDock::clear_snapshot()
 	next_duration_value_->clear();
 	current_path_.clear();
 	has_current_ = false;
-	update_progress(-1, 0);
+	update_progress(-1, -1, -1, -1);
 }
 
 void PlaylistQueueDock::cache_duration(const char *path, int64_t duration_ms)
@@ -648,7 +656,7 @@ int64_t PlaylistQueueDock::cached_duration(const char *path) const
 
 void PlaylistQueueDock::refresh_snapshot()
 {
-	if (selected_source_uuid_.isEmpty()) {
+	if (selected_source_uuid_.isEmpty() || (follow_program_ && !program_target_available_)) {
 		clear_snapshot();
 		return;
 	}
@@ -662,40 +670,47 @@ void PlaylistQueueDock::refresh_snapshot()
 
 	struct mps_playlist_context_snapshot snapshot = {0};
 	const bool found = mps_playlist_context_snapshot_get(source, &snapshot);
-	int64_t time_ms = 0;
-	int64_t duration_ms = 0;
+	struct mps_playlist_telemetry telemetry;
+	mps_playlist_telemetry_init(&telemetry);
 	int64_t standby_duration_ms = 0;
-	const bool timing_found = found && mps_playlist_timing_get(source, &time_ms, &duration_ms);
+	const bool timing_found = found && mps_playlist_telemetry_get(source, &telemetry);
 	const bool standby_duration_found =
 		found && snapshot.next &&
 		mps_playlist_standby_duration_get(source, snapshot.next, &standby_duration_ms);
 	obs_source_release(source);
 	if (!found) {
 		mps_playlist_context_snapshot_free(&snapshot);
+		mps_playlist_telemetry_free(&telemetry);
 		clear_snapshot();
 		return;
 	}
 
 	previous_value_->setFilePath(snapshot.previous);
-	current_value_->setFilePath(snapshot.current);
+	current_value_->setFilePath(timing_found ? telemetry.current_path : nullptr);
 	next_value_->setFilePath(snapshot.next);
 	if (timing_found)
-		cache_duration(snapshot.current, duration_ms);
+		cache_duration(telemetry.current_path, telemetry.duration_media_ms);
 	if (standby_duration_found)
 		cache_duration(snapshot.next, standby_duration_ms);
 	previous_duration_value_->setText(format_media_duration(cached_duration(snapshot.previous)));
 	const int64_t next_duration = cached_duration(snapshot.next);
 	next_duration_value_->setText(next_duration > 0 ? format_media_duration(next_duration) : QString());
-	current_path_ = QString::fromUtf8(snapshot.current ? snapshot.current : "");
-	has_current_ = snapshot.current != nullptr;
-	update_progress(timing_found ? time_ms : -1, timing_found ? duration_ms : 0);
+	current_path_ = QString::fromUtf8(telemetry.current_path ? telemetry.current_path : "");
+	has_current_ = telemetry.current_path != nullptr;
+	update_progress(telemetry.elapsed_media_ms, telemetry.duration_media_ms, telemetry.remaining_ms,
+			telemetry.playlist_remaining_known ? telemetry.playlist_remaining_ms : -1);
+	mps_playlist_telemetry_free(&telemetry);
 	mps_playlist_context_snapshot_free(&snapshot);
 }
 
 void PlaylistQueueDock::refresh_progress()
 {
-	if (!isVisible() || selected_source_uuid_.isEmpty() || !has_current_)
+	if (!isVisible())
 		return;
+	if (selected_source_uuid_.isEmpty() || (follow_program_ && !program_target_available_)) {
+		clear_snapshot();
+		return;
+	}
 
 	const QByteArray uuid = selected_source_uuid_.toUtf8();
 	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
@@ -704,40 +719,41 @@ void PlaylistQueueDock::refresh_progress()
 		return;
 	}
 
-	int64_t time_ms = 0;
-	int64_t duration_ms = 0;
-	const bool found = mps_playlist_timing_get(source, &time_ms, &duration_ms);
+	struct mps_playlist_telemetry telemetry;
+	const bool found = mps_playlist_telemetry_get(source, &telemetry);
 	obs_source_release(source);
 	if (found) {
-		const QByteArray current_path = current_path_.toUtf8();
-		cache_duration(current_path.constData(), duration_ms);
-		update_progress(time_ms, duration_ms);
+		current_value_->setFilePath(telemetry.current_path);
+		current_path_ = QString::fromUtf8(telemetry.current_path ? telemetry.current_path : "");
+		has_current_ = telemetry.current_path != nullptr;
+		cache_duration(telemetry.current_path, telemetry.duration_media_ms);
+		update_progress(telemetry.elapsed_media_ms, telemetry.duration_media_ms, telemetry.remaining_ms,
+				telemetry.playlist_remaining_known ? telemetry.playlist_remaining_ms : -1);
 	} else {
 		clear_snapshot();
 	}
+	mps_playlist_telemetry_free(&telemetry);
 }
 
-void PlaylistQueueDock::update_progress(int64_t time_ms, int64_t duration_ms)
+void PlaylistQueueDock::update_progress(int64_t time_ms, int64_t duration_ms, int64_t remaining_ms,
+					int64_t playlist_remaining_ms)
 {
-	if (!has_current_ || duration_ms <= 0) {
+	playlist_remaining_value_->setText(format_media_time(playlist_remaining_ms));
+	remaining_value_->setText(remaining_ms >= 0 ? QStringLiteral("-") + format_media_time(remaining_ms)
+						    : QStringLiteral("--:--"));
+	elapsed_value_->setText(format_media_time(time_ms));
+	current_duration_value_->setText(format_media_duration(duration_ms));
+	if (!has_current_ || duration_ms <= 0 || time_ms < 0) {
 		progress_bar_->setRange(0, 1);
 		progress_bar_->setValue(0);
-		current_duration_value_->setText(QStringLiteral("--:--"));
-		elapsed_value_->setText(QStringLiteral("--:--"));
-		remaining_value_->setText(QStringLiteral("--:--"));
 		return;
 	}
 
-	if (time_ms < 0)
-		time_ms = 0;
-	else if (time_ms > duration_ms)
+	if (time_ms > duration_ms)
 		time_ms = duration_ms;
 	const int value = static_cast<int>((static_cast<double>(time_ms) * 1000.0) / duration_ms);
 	progress_bar_->setRange(0, 1000);
 	progress_bar_->setValue(value);
-	current_duration_value_->setText(format_media_duration(duration_ms));
-	elapsed_value_->setText(format_media_time(time_ms));
-	remaining_value_->setText(QStringLiteral("-") + format_media_time(duration_ms - time_ms));
 }
 
 void PlaylistQueueDock::showEvent(QShowEvent *event)

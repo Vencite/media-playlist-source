@@ -1,5 +1,11 @@
 # Manual regression checks
 
+For shuffle RNG, activation reset modes, and their lifecycle audit, see
+[Shuffle lifecycle and RNG](shuffle-lifecycle.md).
+
+For authoritative timing, duration inventory and obs-websocket Vendor schema v1,
+see [Playlist telemetry runtime and release checks](playlist-telemetry.md).
+
 ## Audio routing during recording and streaming (#56)
 
 Use media with an audible audio track and an OBS 32 build containing this plugin:
@@ -87,6 +93,8 @@ between the docks is observed.
 5. Put two visible MPS sources in Program. Confirm the status reads
    **2 active MPS**, an already active selected MPS remains selected, and a
    non-active selected source is not replaced by an arbitrary candidate.
+   Queue retains the selection but clears timing while Follow has no unique
+   Program target; it must not display a stale playlist remaining value.
 6. Manually select one of multiple active MPS sources while Follow remains on,
    then switch to a Program scene containing exactly one MPS. Confirm the manual
    choice is accepted first and the later unambiguous scene is followed.
@@ -102,7 +110,9 @@ between the docks is observed.
     canonical active duration for Now Playing, and standby duration for Up Next
     only when already safely available. Confirm unknown, URL, audio-only, and
     non-prefetched targets leave Up Next duration blank when unavailable,
-    without extra media sources, probing, or playback changes.
+    without extra media sources or probing requested by the dock itself.
+    The independent duration inventory can discover future-file durations in
+    the background; it must never change playback.
 11. Check Queue near 280-320 px, 400-500 px, and wider widths. Confirm filenames
     remain left aligned and elide with full-path tooltips, durations stay right
     aligned, separators remain coherent, and no horizontal scrollbar or large

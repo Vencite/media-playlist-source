@@ -18,6 +18,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include <obs-module.h>
 #include <util/darray.h>
 #include "playlist.h"
@@ -31,11 +34,15 @@ struct shuffler {
 	size_t head;
 	size_t next;
 	size_t history;
+	uint64_t rng_state;
 };
 
 void shuffler_init(struct shuffler *s);
 void shuffler_destroy(struct shuffler *s);
 void shuffler_reshuffle(struct shuffler *s);
+void shuffler_reshuffle_avoid(struct shuffler *s, const struct media_file_data *avoid);
+/* Replaces the per-instance PRNG state; used by deterministic tests. */
+void shuffler_set_seed(struct shuffler *s, uint64_t seed);
 static inline void shuffler_determine_one_(struct shuffler *s, size_t avoid_last_n);
 static inline void shuffler_determine_one(struct shuffler *s);
 static void shuffler_auto_reshuffle(struct shuffler *s);

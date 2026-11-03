@@ -29,12 +29,43 @@ selects a specific file in the playlist. Also lets us do reshuffling keeping the
 history.
 */
 
+#if defined(TEST_SHUFFLER) && defined(NDEBUG)
+#undef NDEBUG
+#endif
+
 #include "shuffler.h"
+#include <util/bmem.h>
+#include <util/platform.h>
 
 /* On auto-reshuffle, avoid selecting the same item before at least
  * NOT_SAME_BEFORE other items have been selected (between the end of the
  * previous shuffle and the start of the new shuffle). */
 #define NOT_SAME_BEFORE 1
+
+static uint64_t shuffler_generate_seed(void)
+{
+	/* OBS provides an OS-entropy UUID on every supported platform. Hash the
+	 * whole string because UUID version/variant bits are not random. */
+	char *uuid = os_generate_uuid();
+	uint64_t seed = 0xcbf29ce484222325ULL;
+
+	for (const unsigned char *c = (const unsigned char *)uuid; *c; ++c) {
+		seed ^= *c;
+		seed *= 0x100000001b3ULL;
+	}
+	bfree(uuid);
+	return seed;
+}
+
+static uint64_t shuffler_rng_next(struct shuffler *s)
+{
+	/* SplitMix64; each shuffler owns its state, so instances cannot
+	 * consume each other's random stream. */
+	uint64_t z = (s->rng_state += 0x9e3779b97f4a7c15ULL);
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+	return z ^ (z >> 31);
+}
 
 void shuffler_init(struct shuffler *s)
 {
@@ -42,7 +73,13 @@ void shuffler_init(struct shuffler *s)
 	s->next = 0;
 	s->history = 0;
 	s->loop = false;
+	s->rng_state = shuffler_generate_seed();
 	da_init(s->shuffled_files);
+}
+
+void shuffler_set_seed(struct shuffler *s, uint64_t seed)
+{
+	s->rng_state = seed;
 }
 
 void shuffler_destroy(struct shuffler *s)
@@ -62,12 +99,29 @@ void shuffler_reshuffle(struct shuffler *s)
 	s->history = s->shuffled_files.num;
 }
 
+void shuffler_reshuffle_avoid(struct shuffler *s, const struct media_file_data *avoid)
+{
+	shuffler_reshuffle(s);
+
+	if (!avoid || s->shuffled_files.num < 2)
+		return;
+
+	size_t index = da_find(s->shuffled_files, &avoid, 0);
+	if (index == DARRAY_INVALID)
+		return;
+
+	/* Keep the avoided item out of the first Fisher-Yates step. The normal
+	 * next call then consumes the determined first item. */
+	da_swap(s->shuffled_files, index, s->shuffled_files.num - 1);
+	shuffler_determine_one_(s, 1);
+}
+
 static inline void shuffler_determine_one_(struct shuffler *s, size_t avoid_last_n)
 {
 	assert(s->head < s->shuffled_files.num);
 	assert(s->shuffled_files.num - s->head > avoid_last_n);
 	size_t range_len = s->shuffled_files.num - s->head - avoid_last_n;
-	size_t selected = s->head + (rand() % range_len);
+	size_t selected = s->head + (size_t)(shuffler_rng_next(s) % range_len);
 	da_swap(s->shuffled_files, s->head, selected);
 
 	if (s->head == s->history)
@@ -246,7 +300,7 @@ static void shuffler_remove_at(struct shuffler *s, size_t index)
 static void shuffler_remove_one(struct shuffler *s, const struct media_file_data *item)
 {
 	size_t index = da_find(s->shuffled_files, &item, 0);
-	assert(index >= 0 && index != DARRAY_INVALID); /* item must exist */
+	assert(index != DARRAY_INVALID); /* item must exist */
 	shuffler_remove_at(s, index);
 }
 
@@ -305,13 +359,13 @@ size_t find_media_index(struct darray *array, struct media_file_data *search_dat
 			 * In other words, don't break this code.
 			 */
 
-			if (strcmp(current_data->parent_id, search_data->parent_id) == 0) {
+			if (current_data->parent_id && strcmp(current_data->parent_id, search_data->parent_id) == 0) {
 				int match = strcmp(search_data->filename, current_data->filename);
 				if (match == 0) {
 					return i;
 				}
 			}
-		} else if (strcmp(search_data->id, current_data->id) == 0) {
+		} else if (!current_data->parent_id && strcmp(search_data->id, current_data->id) == 0) {
 			return i;
 		}
 	}
@@ -348,8 +402,10 @@ void shuffler_update_files(struct shuffler *s, struct darray *array)
 				}
 			}
 			// history can never be lower than head, it represents the first
-			// element of the previous cycle history
-			for (size_t i = s->shuffled_files.num - 1; i >= s->history; i--) {
+			// element of the previous cycle history. A zero history after a
+			// manual selection means the ordered history part is empty.
+			size_t history_start = s->history ? s->history : s->shuffled_files.num;
+			for (size_t i = s->shuffled_files.num; i-- > history_start;) {
 				struct media_file_data *old_data = s->shuffled_files.array[i];
 				size_t new_idx = find_media_index(&shuffled_files.da, old_data, new_head);
 				if (new_idx != DARRAY_INVALID) {
@@ -420,6 +476,8 @@ static void ArrayDeepCopy(struct darray *src, struct darray *dst)
 
 	for (size_t i = 0; i < orig.num; i++) {
 		struct media_file_data *media = &copy.array[i];
+		if (media->id)
+			media->id = bstrdup(orig.array[i].id);
 		if (media->filename) {
 			media->filename = bstrdup(orig.array[i].filename);
 		}
@@ -427,9 +485,12 @@ static void ArrayDeepCopy(struct darray *src, struct darray *dst)
 		da_copy(media->folder_items, orig.array[i].folder_items);
 		for (size_t j = 0; j < media->folder_items.num; j++) {
 			struct media_file_data *folder_item = &media->folder_items.array[j];
+			if (folder_item->id)
+				folder_item->id = bstrdup(folder_item->id);
 			if (folder_item->filename) {
 				folder_item->filename = bstrdup(folder_item->filename);
 			}
+			folder_item->parent_id = media->id;
 		}
 	}
 	*dst = copy.da;
@@ -484,6 +545,7 @@ static void test_all_items_selected_exactly_once(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 #define SIZE 100
 	DARRAY(struct media_file_data) items;
@@ -516,6 +578,7 @@ static void test_all_items_selected_exactly_once_per_cycle(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 	shuffler_set_loop(&shuffler, true);
 
 #define SIZE 100
@@ -551,6 +614,7 @@ static void test_all_items_selected_exactly_once_with_additions(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 #define SIZE 100
 	DARRAY(struct media_file_data) items;
@@ -593,6 +657,7 @@ static void test_all_items_selected_exactly_once_with_removals(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 #define SIZE 100
 	DARRAY(struct media_file_data) items;
@@ -645,6 +710,7 @@ static void test_cycle_after_manual_selection(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 	shuffler_set_loop(&shuffler, true);
 
 #define SIZE 100
@@ -675,6 +741,7 @@ static void test_cycle_with_additions_and_removals(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 	shuffler_set_loop(&shuffler, true);
 
 #define SIZE 100
@@ -752,6 +819,7 @@ static void test_force_select_new_item(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 #define SIZE 100
 	DARRAY(struct media_file_data) items;
@@ -792,6 +860,7 @@ static void test_force_select_item_already_selected(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 #define SIZE 100
 	DARRAY(struct media_file_data) items;
@@ -835,6 +904,7 @@ static void test_prev(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 #define SIZE 10
 	DARRAY(struct media_file_data) items;
@@ -878,6 +948,7 @@ static void test_prev_with_select(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 #define SIZE 10
 	DARRAY(struct media_file_data) items;
@@ -927,6 +998,7 @@ static void test_prev_across_reshuffle_loops(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 #define SIZE 10
 	DARRAY(struct media_file_data) items;
@@ -1003,6 +1075,7 @@ static void test_loop_respect_not_same_before(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 	shuffler_set_loop(&shuffler, true);
 
 #define SIZE (NOT_SAME_BEFORE + 2)
@@ -1046,6 +1119,7 @@ static void test_loop_respect_not_same_before_impossible(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 	shuffler_set_loop(&shuffler, true);
 
 #define SIZE NOT_SAME_BEFORE
@@ -1071,6 +1145,7 @@ static void test_has_prev_next_empty(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 
 	assert(!shuffler_has_prev(&shuffler));
 	assert(!shuffler_has_next(&shuffler));
@@ -1079,8 +1154,8 @@ static void test_has_prev_next_empty(void)
 
 	assert(!shuffler_has_prev(&shuffler));
 
-	/* there are always next items in loop mode */
-	assert(shuffler_has_next(&shuffler));
+	/* an empty shuffler has no next items even in loop mode */
+	assert(!shuffler_has_next(&shuffler));
 
 	shuffler_destroy(&shuffler);
 }
@@ -1089,6 +1164,7 @@ static void test_update_files_with_additions_and_removals(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 	shuffler_set_loop(&shuffler, true);
 
 #define SIZE 100
@@ -1108,7 +1184,7 @@ static void test_update_files_with_additions_and_removals(void)
 	for (int i = 0; i < 30; i++) {
 		assert(shuffler_has_next(&shuffler));
 		shuffler_select_index(&shuffler, i);
-		assert(shuffler.next == i + 1);
+		assert(shuffler.next == (size_t)(i + 1));
 		struct media_file_data *item = shuffler.shuffled_files.array[shuffler.next - 1];
 		assert(item);
 	}
@@ -1184,6 +1260,7 @@ static void test_update_files_folders_with_additions_and_removals(void)
 {
 	struct shuffler shuffler;
 	shuffler_init(&shuffler);
+	shuffler_set_seed(&shuffler, 0x123456789abcdef0ULL);
 	shuffler_set_loop(&shuffler, true);
 
 #define SIZE 40

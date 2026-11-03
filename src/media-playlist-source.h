@@ -43,10 +43,41 @@ enum restart_behavior {
 	RESTART_BEHAVIOR_FIRST_FILE,
 };
 
+enum shuffle_reset_behavior {
+	SHUFFLE_RESET_PRESERVE,
+	SHUFFLE_RESET_ON_ACTIVATE,
+};
+
 /* clang-format on */
 
 struct media_playlist_source;
 struct media_source_callback_context;
+struct mps_duration_inventory;
+
+/* Scalar meaning of one telemetry observation. snapshot_revision advances only
+ * when this meaning changes, so continuous elapsed/remaining drift and query
+ * frequency never move it. Raw current duration and the effective total of the
+ * entries after the current one are included; elapsed and the current/playlist
+ * remaining values are not. */
+struct mps_telemetry_meaning {
+	enum obs_media_state state;
+	int64_t speed_percent;
+	int64_t duration_ms;
+	int64_t future_media_ms;
+	size_t playlist_index;
+	size_t folder_item_index;
+	size_t items_remaining;
+	bool future_known;
+	bool current_remaining_known;
+	bool playlist_remaining_known;
+	bool shuffle;
+	bool loop;
+	bool has_next;
+	bool has_previous;
+	char *item_id;
+	char *file;
+	char *source_name;
+};
 
 struct media_source_slot {
 	struct media_playlist_source *owner;
@@ -87,11 +118,33 @@ struct media_playlist_source {
 	bool prefetch_dirty;
 	bool destroying;
 	bool resetting;
+	bool source_active;
+	bool fresh_shuffle_pending;
 	size_t consecutive_failures;
 	pthread_mutex_t lifecycle_mutex;
 
 	struct shuffler shuffler;
+	struct mps_duration_inventory *duration_inventory;
+	/* Observers are serialized by telemetry_mutex, which playback never takes.
+	 * telemetry_discontinuity is bumped by mps_playlist_change_notify under
+	 * lifecycle_mutex so a read raced by an event is rejected. */
+	pthread_mutex_t telemetry_mutex;
+	uint64_t telemetry_revision;
+	struct mps_telemetry_meaning telemetry_meaning;
+	uint64_t telemetry_discontinuity;
+	uint64_t telemetry_observed_discontinuity;
+	uint64_t telemetry_clock_generation;
+	enum obs_media_state telemetry_clock_state;
+	int64_t telemetry_idle_clock_ms;
+	/* Set by a successful cut when the shuffle cycle ends at that item, before
+	 * the prefetch can auto-reshuffle the queue. Guarded by lifecycle_mutex. */
+	uint64_t telemetry_cycle_exhausted_generation;
+	bool telemetry_meaning_valid;
+	bool telemetry_cycle_exhausted;
 	bool shuffle;
+	enum shuffle_reset_behavior shuffle_reset_behavior;
+	char *activation_first_id;
+	char *activation_first_filename;
 	bool loop;
 	bool paused;
 	bool use_hw_decoding;

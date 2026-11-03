@@ -19,10 +19,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "media-playlist-source.h"
 #include "playlist-context.h"
 #include "playlist-dock.h"
+#include "playlist-telemetry.h"
+#include "duration-inventory.h"
 
 #define S_PLAYLIST "playlist"
 #define S_LOOP "loop"
 #define S_SHUFFLE "shuffle"
+#define S_SHUFFLE_RESET_BEHAVIOR "shuffle_reset_behavior"
 #define S_VISIBILITY_BEHAVIOR "visibility_behavior"
 #define S_RESTART_BEHAVIOR "restart_behavior"
 #define S_CURRENT_FILE_NAME "current_file_name"
@@ -49,6 +52,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_PLAYLIST T_("Playlist")
 #define T_LOOP T_("LoopPlaylist")
 #define T_SHUFFLE T_("Shuffle")
+#define T_SHUFFLE_RESET_BEHAVIOR T_("ShuffleResetBehavior")
+#define T_SHUFFLE_RESET_PRESERVE T_("ShuffleResetBehavior.Preserve")
+#define T_SHUFFLE_RESET_ON_ACTIVATE T_("ShuffleResetBehavior.OnActivate")
 #define T_VISIBILITY_BEHAVIOR T_("VisibilityBehavior")
 #define T_VISIBILITY_BEHAVIOR_STOP_RESTART T_("VisibilityBehavior.StopRestart")
 #define T_VISIBILITY_BEHAVIOR_PAUSE_UNPAUSE T_("VisibilityBehavior.PauseUnpause")
@@ -66,6 +72,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_SPEED T_("Speed")
 #define T_SPEED_WARNING T_("SpeedWarning")
 #define T_REFRESH_FILENAME T_("RefreshFilename")
+
+/* A snapshot needs the state before and after the decoder clock read to match;
+ * a cut racing the read is retried this many times. */
+#define MPS_TELEMETRY_READ_ATTEMPTS 2
+/* Bound read-only enumeration/copying and cache lookups per observation. */
+#define MPS_TELEMETRY_MAX_DURATION_LOOKUPS MPS_DURATION_INVENTORY_MAX_ENTRIES
 
 #define T_PLAY_PAUSE T_("PlayPause")
 #define T_RESTART T_("Restart")
@@ -105,6 +117,9 @@ static void prepare_next_media(struct media_playlist_source *mps);
 
 static void mps_playlist_change_notify(struct media_playlist_source *mps)
 {
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	++mps->telemetry_discontinuity;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 	char *source_uuid = NULL;
 	DARRAY(struct mps_change_listener *) listeners;
 	da_init(listeners);
@@ -283,6 +298,34 @@ static struct media_playlist_source *mps_registry_lookup(obs_source_t *source)
 	return mps;
 }
 
+static void invalidate_shuffle_cycle_exhausted(struct media_playlist_source *mps)
+{
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->telemetry_cycle_exhausted = false;
+	mps->telemetry_cycle_exhausted_generation = 0;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+}
+
+/* Called after a cut publishes slot and before prepare_next_media() can
+ * auto-reshuffle an exhausted cycle. Keeping the fact together with the
+ * generation lets observers report a known empty current pass afterwards. */
+static void record_shuffle_cycle_exhausted(struct media_playlist_source *mps, struct media_source_slot *slot)
+{
+	bool exhausted;
+
+	pthread_mutex_lock(&mps->mutex);
+	exhausted = mps->shuffle && mps->shuffler.shuffled_files.num > 0 &&
+		    mps->shuffler.next == mps->shuffler.shuffled_files.num;
+	pthread_mutex_unlock(&mps->mutex);
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (mps->active_slot == slot && slot->source) {
+		mps->telemetry_cycle_exhausted = exhausted;
+		mps->telemetry_cycle_exhausted_generation = slot->source_generation;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+}
+
 bool mps_playlist_context_snapshot_get(obs_source_t *source, struct mps_playlist_context_snapshot *snapshot)
 {
 	struct media_playlist_source *mps;
@@ -397,6 +440,398 @@ bool mps_playlist_standby_duration_get(obs_source_t *source, const char *expecte
 	*duration_ms = obs_source_media_get_duration(standby_source);
 	obs_source_release(standby_source);
 	return *duration_ms > 0;
+}
+
+static const char *telemetry_basename(const char *path)
+{
+	const char *slash = strrchr(path, '/');
+	const char *backslash = strrchr(path, '\\');
+
+	if (!slash || (backslash && backslash > slash))
+		slash = backslash;
+	return slash ? slash + 1 : path;
+}
+
+static char *telemetry_item_id(const char *id, const char *filename)
+{
+	if (!id || !*id)
+		return NULL;
+	if (!filename)
+		return bstrdup(id);
+	struct dstr value = {0};
+	dstr_cat(&value, id);
+	dstr_cat_ch(&value, '/');
+	dstr_cat(&value, filename);
+	return value.array;
+}
+
+static struct media_file_data *telemetry_current_locked(struct media_playlist_source *mps, const char *id,
+							const char *filename, const char *path)
+{
+	if (!id || !path)
+		return NULL;
+	for (size_t i = 0; i < mps->files.num && i < MPS_TELEMETRY_MAX_DURATION_LOOKUPS; ++i) {
+		struct media_file_data *media = &mps->files.array[i];
+		if (!media->id || strcmp(media->id, id) != 0)
+			continue;
+		if (!filename)
+			return !media->is_folder && strcmp(media->path, path) == 0 ? media : NULL;
+		for (size_t j = 0; j < media->folder_items.num && j < MPS_TELEMETRY_MAX_DURATION_LOOKUPS; ++j) {
+			struct media_file_data *child = &media->folder_items.array[j];
+			if (strcmp(child->filename, filename) == 0 && strcmp(child->path, path) == 0)
+				return child;
+		}
+	}
+	return NULL;
+}
+
+/* Bound copying while holding the playlist lock, not just subsequent cache
+ * lookups. Oversized inventories are unknown rather than stalling playback. */
+static bool telemetry_pass_bounded(const struct media_playlist_source *mps)
+{
+	if (mps->files.num > MPS_TELEMETRY_MAX_DURATION_LOOKUPS)
+		return false;
+	size_t count = 0;
+	for (size_t i = 0; i < mps->files.num; ++i) {
+		const struct media_file_data *media = &mps->files.array[i];
+		size_t added = media->is_folder ? media->folder_items.num : 1;
+		if (added > MPS_TELEMETRY_MAX_DURATION_LOOKUPS - count)
+			return false;
+		count += added;
+	}
+	return true;
+}
+
+static bool telemetry_string_equal(const char *left, const char *right)
+{
+	if (left == right)
+		return true;
+	if (!left || !right)
+		return false;
+	return strcmp(left, right) == 0;
+}
+
+/* True when the current clock and speed make the current remaining value
+ * computable. Only the fact is part of the fingerprint, never the value. */
+static bool telemetry_current_remaining_known(const struct mps_playlist_telemetry *snapshot)
+{
+	return snapshot->current_path != NULL && snapshot->duration_media_ms > 0 && snapshot->elapsed_media_ms >= 0 &&
+	       snapshot->speed_percent > 0;
+}
+
+static void telemetry_meaning_store(struct mps_telemetry_meaning *meaning,
+				    const struct mps_playlist_telemetry *snapshot, bool future_known,
+				    int64_t future_media_ms)
+{
+	char *item_id = snapshot->current_item_id ? bstrdup(snapshot->current_item_id) : NULL;
+	char *file = snapshot->current_file ? bstrdup(snapshot->current_file) : NULL;
+	char *source_name = snapshot->source_name ? bstrdup(snapshot->source_name) : NULL;
+
+	bfree(meaning->source_name);
+	meaning->source_name = source_name;
+	bfree(meaning->item_id);
+	bfree(meaning->file);
+	meaning->item_id = item_id;
+	meaning->file = file;
+	meaning->state = snapshot->state;
+	meaning->speed_percent = snapshot->speed_percent;
+	meaning->duration_ms = snapshot->duration_media_ms;
+	meaning->future_media_ms = future_media_ms;
+	meaning->playlist_index = snapshot->playlist_index;
+	meaning->folder_item_index = snapshot->folder_item_index;
+	meaning->items_remaining = snapshot->items_remaining;
+	meaning->future_known = future_known;
+	meaning->current_remaining_known = telemetry_current_remaining_known(snapshot);
+	meaning->playlist_remaining_known = snapshot->playlist_remaining_known;
+	meaning->shuffle = snapshot->shuffle;
+	meaning->loop = snapshot->loop;
+	meaning->has_next = snapshot->has_next;
+	meaning->has_previous = snapshot->has_previous;
+}
+
+static bool telemetry_meaning_matches(const struct mps_telemetry_meaning *meaning,
+				      const struct mps_playlist_telemetry *snapshot, bool future_known,
+				      int64_t future_media_ms)
+{
+	return meaning->state == snapshot->state && meaning->speed_percent == snapshot->speed_percent &&
+	       meaning->duration_ms == snapshot->duration_media_ms && meaning->future_media_ms == future_media_ms &&
+	       meaning->future_known == future_known && meaning->playlist_index == snapshot->playlist_index &&
+	       meaning->folder_item_index == snapshot->folder_item_index &&
+	       meaning->items_remaining == snapshot->items_remaining &&
+	       meaning->current_remaining_known == telemetry_current_remaining_known(snapshot) &&
+	       meaning->playlist_remaining_known == snapshot->playlist_remaining_known &&
+	       meaning->shuffle == snapshot->shuffle && meaning->loop == snapshot->loop &&
+	       meaning->has_next == snapshot->has_next && meaning->has_previous == snapshot->has_previous &&
+	       telemetry_string_equal(meaning->item_id, snapshot->current_item_id) &&
+	       telemetry_string_equal(meaning->file, snapshot->current_file) &&
+	       telemetry_string_equal(meaning->source_name, snapshot->source_name);
+}
+
+/* Caller holds telemetry_mutex. A changed fingerprint advances the revision, and
+ * so does an event serial observed since the previous read: several
+ * notifications between two reads coalesce into one advance, while a read that
+ * observed nothing new never advances it. */
+static uint64_t telemetry_observe(struct media_playlist_source *mps, const struct mps_playlist_telemetry *snapshot,
+				  bool future_known, int64_t future_media_ms, uint64_t discontinuity)
+{
+	bool changed = !mps->telemetry_meaning_valid ||
+		       !telemetry_meaning_matches(&mps->telemetry_meaning, snapshot, future_known, future_media_ms);
+
+	if (changed || discontinuity != mps->telemetry_observed_discontinuity) {
+		++mps->telemetry_revision;
+		if (changed) {
+			telemetry_meaning_store(&mps->telemetry_meaning, snapshot, future_known, future_media_ms);
+			mps->telemetry_meaning_valid = true;
+		}
+		mps->telemetry_observed_discontinuity = discontinuity;
+	}
+	return mps->telemetry_revision;
+}
+
+/* Must be called with the playlist lock held. The pass snapshot does not carry
+ * is_url, so resolve it from the configured entry. An unresolvable entry is
+ * treated as a URL: its duration is never trusted from the file inventory. */
+static bool telemetry_item_is_url_locked(const struct media_playlist_source *mps,
+					 const struct mps_playlist_item_snapshot *item)
+{
+	const struct media_file_data *top;
+
+	if (!item || item->media_index >= mps->files.num)
+		return true;
+	top = &mps->files.array[item->media_index];
+	if (!item->is_folder_child)
+		return top->is_url;
+	if (!top->is_folder || item->folder_item_index >= top->folder_items.num)
+		return true;
+	return top->folder_items.array[item->folder_item_index].is_url;
+}
+
+/* Reads state that the active slot committed, never a request that is still
+ * being prepared. Decoder clocks come from a retained reference to that same
+ * child; the caller validates the generation after the read. */
+static bool telemetry_read_once(struct media_playlist_source *mps, obs_source_t *source,
+				struct mps_playlist_telemetry *snapshot, uint64_t *discontinuity_out,
+				bool *future_known_out, int64_t *future_media_ms_out)
+{
+	struct mps_playlist_item_snapshot *remaining = NULL;
+	size_t count = 0;
+	bool pass_known = false;
+	obs_source_t *clock_source = NULL;
+	uint64_t generation = 0;
+	uint64_t discontinuity;
+	enum obs_media_state cached_state;
+	enum obs_media_state clock_state = OBS_MEDIA_STATE_NONE;
+	char *media_id = NULL;
+	char *folder_filename = NULL;
+	char *path = NULL;
+	bool *future_url = NULL;
+	bool is_url = false;
+	bool resetting = false;
+	bool cycle_exhausted = false;
+	int64_t configured_speed;
+	int64_t elapsed = -1;
+	int64_t duration = -1;
+	struct media_source_slot *slot;
+
+	*discontinuity_out = 0;
+	*future_known_out = false;
+	*future_media_ms_out = -1;
+	if (mps->source_uuid && *mps->source_uuid)
+		snapshot->source_uuid = bstrdup(mps->source_uuid);
+	const char *source_name = obs_source_get_name(source);
+	if (source_name && *source_name)
+		snapshot->source_name = bstrdup(source_name);
+
+	pthread_mutex_lock(&mps->mutex);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	discontinuity = mps->telemetry_discontinuity;
+	cached_state = mps->state;
+	snapshot->shuffle = mps->shuffle;
+	snapshot->loop = mps->loop;
+	resetting = mps->resetting;
+	slot = mps->active_slot;
+	if (slot && slot->path && *slot->path) {
+		path = bstrdup(slot->path);
+		media_id = slot->media_id ? bstrdup(slot->media_id) : NULL;
+		folder_filename = slot->folder_item_filename ? bstrdup(slot->folder_item_filename) : NULL;
+		is_url = slot->is_url;
+		if (slot->source && !slot->failed) {
+			clock_source = obs_source_get_ref(slot->source);
+			generation = slot->source_generation;
+		}
+		cycle_exhausted = mps->telemetry_cycle_exhausted &&
+				  mps->telemetry_cycle_exhausted_generation == slot->source_generation;
+	}
+	configured_speed = mps->speed >= 1 && mps->speed <= 200 ? mps->speed : 100;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	struct media_file_data *current = path ? telemetry_current_locked(mps, media_id, folder_filename, path) : NULL;
+	if (current && !resetting) {
+		struct media_file_data *parent = current->parent ? current->parent : current;
+		size_t folder_index = current->parent ? current->index : 0;
+		snapshot->playlist_index = parent->index;
+		snapshot->folder_item_index = current->parent ? current->index : SIZE_MAX;
+		if (mps->shuffle && cycle_exhausted) {
+			/* The active item ended its cycle and the next-item prefetch
+			 * already rolled the queue into a new cycle; the current pass
+			 * therefore has no remaining entries. */
+			pass_known = true;
+		} else {
+			struct mps_playlist_context_input input = {
+				.files = &mps->files.da,
+				.shuffler = &mps->shuffler,
+				.shuffle = mps->shuffle,
+				.loop = mps->loop,
+				.current_media = parent,
+				.actual_media = current,
+				.current_media_index = parent->index,
+				.current_folder_item_index = folder_index,
+			};
+			/* A pending manual selection moves the shuffle cursor away
+			 * from the committed item; the pass copy then reports unknown
+			 * instead of guessing. */
+			pass_known = telemetry_pass_bounded(mps) && mps_playlist_pass_copy(&input, &remaining, &count);
+			if (pass_known && count > 0 && count <= MPS_TELEMETRY_MAX_DURATION_LOOKUPS) {
+				future_url = bmalloc(count * sizeof(*future_url));
+				if (future_url) {
+					for (size_t i = 0; i < count; ++i)
+						future_url[i] = telemetry_item_is_url_locked(mps, &remaining[i]);
+				}
+			}
+		}
+		snapshot->has_next = mps->shuffle ? shuffler_has_next(&mps->shuffler)
+						  : mps_next_sequential_media(&mps->files.da, parent, parent->index,
+									      folder_index, mps->loop) != NULL;
+		snapshot->has_previous = mps->shuffle
+						 ? shuffler_has_prev(&mps->shuffler)
+						 : mps_previous_sequential_media(&mps->files.da, parent, parent->index,
+										 folder_index, mps->loop) != NULL;
+	}
+	pthread_mutex_unlock(&mps->mutex);
+
+	if (path) {
+		snapshot->current_path = path;
+		path = NULL;
+		snapshot->current_item_id = telemetry_item_id(media_id, folder_filename);
+		const char *current_file = telemetry_basename(snapshot->current_path);
+		if (*current_file)
+			snapshot->current_file = bstrdup(current_file);
+		snapshot->speed_percent = is_url ? 100 : configured_speed;
+	}
+	bfree(media_id);
+	bfree(folder_filename);
+
+	if (clock_source) {
+		elapsed = obs_source_media_get_time(clock_source);
+		duration = obs_source_media_get_duration(clock_source);
+		clock_state = obs_source_media_get_state(clock_source);
+	}
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	bool coherent = discontinuity == mps->telemetry_discontinuity &&
+			(!clock_source || (mps->active_slot && mps->active_slot->source == clock_source &&
+					   mps->active_slot->source_generation == generation));
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (clock_source)
+		obs_source_release(clock_source);
+	if (!coherent) {
+		bfree(future_url);
+		mps_playlist_entries_free(remaining, count);
+		return false;
+	}
+
+	/* The child clock is authoritative: OBS freezes it while paused and a seek
+	 * updates it immediately, so no wall-clock cache is layered on top. */
+	snapshot->state = clock_state != OBS_MEDIA_STATE_NONE ? clock_state : cached_state;
+	if (!clock_source &&
+	    (snapshot->state == OBS_MEDIA_STATE_PLAYING || snapshot->state == OBS_MEDIA_STATE_OPENING ||
+	     snapshot->state == OBS_MEDIA_STATE_BUFFERING))
+		/* No committed decoder: do not present a playing clock. */
+		snapshot->state = OBS_MEDIA_STATE_NONE;
+	if (snapshot->current_path) {
+		snapshot->elapsed_media_ms = elapsed >= 0 ? elapsed : -1;
+		snapshot->duration_media_ms = duration > 0 ? duration : -1;
+	}
+
+	int64_t *durations = NULL;
+	int64_t *future_speeds = NULL;
+	/* Cache lookups do no I/O. Without resolved URL flags the durations
+	 * cannot be trusted, even when an entry shares a cached local path. */
+	bool lookup_durations = count > 0 && count <= MPS_TELEMETRY_MAX_DURATION_LOOKUPS && future_url != NULL;
+	if (lookup_durations) {
+		durations = bmalloc(count * sizeof(*durations));
+		future_speeds = bmalloc(count * sizeof(*future_speeds));
+		if (!durations || !future_speeds) {
+			bfree(durations);
+			bfree(future_speeds);
+			durations = NULL;
+			future_speeds = NULL;
+			lookup_durations = false;
+		}
+	}
+	if (lookup_durations) {
+		for (size_t i = 0; i < count; ++i) {
+			durations[i] = -1;
+			future_speeds[i] = future_url[i] ? 100 : configured_speed;
+			/* A URL or stream has no authoritative file duration even if a
+			 * cache entry shares its path. */
+			if (!future_url[i])
+				mps_duration_inventory_get(mps->duration_inventory, remaining[i].path, &durations[i]);
+		}
+	}
+	mps_playlist_telemetry_calculate_at_speeds(snapshot, lookup_durations ? durations : NULL,
+						   lookup_durations ? future_speeds : NULL, count, pass_known);
+	bfree(durations);
+	bfree(future_speeds);
+	bfree(future_url);
+	mps_playlist_entries_free(remaining, count);
+
+	/* The fingerprint uses the effective total of the entries after the current
+	 * one, never the playlist total that also contains current-clock drift. It
+	 * is derivable exactly when the pass and both totals are known. */
+	if (snapshot->playlist_remaining_known && snapshot->remaining_ms >= 0) {
+		*future_known_out = true;
+		*future_media_ms_out = snapshot->playlist_remaining_ms - snapshot->remaining_ms;
+	}
+	*discontinuity_out = discontinuity;
+	return true;
+}
+
+/* Caller owns a source reference. No filesystem access, duration probe or
+ * shuffle draw happens in this query: the inventory is read from its cache and
+ * the pass is copied read-only. */
+bool mps_playlist_telemetry_get(obs_source_t *source, struct mps_playlist_telemetry *snapshot)
+{
+	if (!source || !snapshot)
+		return false;
+	mps_playlist_telemetry_init(snapshot);
+	struct media_playlist_source *mps = mps_registry_lookup(source);
+	if (!mps)
+		return false;
+
+	pthread_mutex_lock(&mps->telemetry_mutex);
+	bool read = false;
+	uint64_t discontinuity = 0;
+	bool future_known = false;
+	int64_t future_media_ms = -1;
+	for (unsigned attempt = 0; attempt < MPS_TELEMETRY_READ_ATTEMPTS && !read; ++attempt) {
+		if (attempt) {
+			mps_playlist_telemetry_free(snapshot);
+			mps_playlist_telemetry_init(snapshot);
+		}
+		read = telemetry_read_once(mps, source, snapshot, &discontinuity, &future_known, &future_media_ms);
+	}
+	if (read)
+		snapshot->snapshot_revision =
+			telemetry_observe(mps, snapshot, future_known, future_media_ms, discontinuity);
+	else {
+		/* Never publish a half-observed item: after a racing event the caller
+		 * gets no snapshot rather than stale partial timing. */
+		mps_playlist_telemetry_free(snapshot);
+		mps_playlist_telemetry_init(snapshot);
+	}
+	pthread_mutex_unlock(&mps->telemetry_mutex);
+	return read;
 }
 
 struct media_source_callback_context {
@@ -988,6 +1423,7 @@ static void select_index_proc_(struct media_playlist_source *mps, size_t media_i
 		if (mps->actual_media) {
 			update_media_source(mps, true);
 			if (mps->shuffle) {
+				invalidate_shuffle_cycle_exhausted(mps);
 				shuffler_select(&mps->shuffler, mps->actual_media);
 			}
 			pthread_mutex_lock(&mps->lifecycle_mutex);
@@ -1073,7 +1509,22 @@ static size_t find_folder_item_index(struct darray *array, const char *filename)
 static void set_media_state(void *data, enum obs_media_state state)
 {
 	struct media_playlist_source *mps = data;
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	bool changed = mps->state != state;
 	mps->state = state;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (changed)
+		mps_playlist_change_notify(mps);
+}
+
+static enum obs_media_state get_media_state(struct media_playlist_source *mps)
+{
+	enum obs_media_state state;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	state = mps->state;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	return state;
 }
 
 static enum obs_media_state mps_get_state(void *data)
@@ -1246,10 +1697,10 @@ static int64_t mps_get_time(void *data)
 	struct media_playlist_source *mps = data;
 
 	obs_source_t *source = get_active_source_ref(mps);
-	int64_t time = source ? obs_source_media_get_time(source) : 0;
+	int64_t time_ms = source ? obs_source_media_get_time(source) : 0;
 	if (source)
 		obs_source_release(source);
-	return time;
+	return time_ms;
 }
 
 static void mps_set_time(void *data, int64_t ms)
@@ -1257,10 +1708,13 @@ static void mps_set_time(void *data, int64_t ms)
 	struct media_playlist_source *mps = data;
 
 	obs_source_t *source = get_active_source_ref(mps);
-	if (source) {
-		obs_source_media_set_time(source, ms);
-		obs_source_release(source);
-	}
+	if (!source)
+		return;
+	obs_source_media_set_time(source, ms);
+	obs_source_release(source);
+	/* OBS queues the child action. Notify now, then the existing lifecycle
+	 * tick also observes its applied state/paused-clock discontinuity. */
+	mps_playlist_change_notify(mps);
 }
 
 static void play_pause_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -1366,6 +1820,10 @@ static void mps_restart(void *data)
 				set_current_folder_item_index(mps, 0);
 			else
 				update_media_source(mps, true);
+			if (mps->shuffle) {
+				invalidate_shuffle_cycle_exhausted(mps);
+				shuffler_select(&mps->shuffler, mps->actual_media);
+			}
 		}
 		pthread_mutex_unlock(&mps->mutex);
 		if (clear_source)
@@ -1376,7 +1834,7 @@ static void mps_restart(void *data)
 			obs_source_save(mps->source);
 		request_media_switch(mps, MPS_SWITCH_NEXT, false);
 	} else if (mps->restart_behavior == RESTART_BEHAVIOR_CURRENT_FILE) {
-		if (mps->state == OBS_MEDIA_STATE_ENDED) {
+		if (get_media_state(mps) == OBS_MEDIA_STATE_ENDED) {
 			pthread_mutex_lock(&mps->mutex);
 			update_media_source(mps, true);
 			pthread_mutex_unlock(&mps->mutex);
@@ -1445,6 +1903,7 @@ static void mps_playlist_next(void *data)
 		goto notify;
 	if (!playlist_has_next(mps))
 		goto notify;
+	invalidate_shuffle_cycle_exhausted(mps);
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	automatic = mps->automatic_next_pending;
@@ -1539,6 +1998,7 @@ static void mps_playlist_prev(void *data)
 		goto notify;
 	if (!playlist_has_previous(mps))
 		goto notify;
+	invalidate_shuffle_cycle_exhausted(mps);
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	retrying = mps->retrying_switch;
@@ -1613,11 +2073,91 @@ notify:
 		mps_playlist_change_notify(mps);
 }
 
+/* Runs on the video lifecycle thread, before processing slot events. */
+static void activate_fresh_shuffle(struct media_playlist_source *mps)
+{
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	if (!mps->fresh_shuffle_pending || !mps->source_active || mps->resetting || mps->destroying) {
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		return;
+	}
+	mps->fresh_shuffle_pending = false;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	pthread_mutex_lock(&mps->mutex);
+	bool fresh = mps->shuffle && mps->shuffle_reset_behavior == SHUFFLE_RESET_ON_ACTIVATE &&
+		     mps->shuffler.shuffled_files.num > 0;
+	pthread_mutex_unlock(&mps->mutex);
+	if (!fresh)
+		return;
+
+	/* Do not enqueue a parent Stop: it would cancel the new request next tick. */
+	mps_stop(mps);
+	cancel_pending_transition(mps, true, false);
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->automatic_next_pending = false;
+	mps->retrying_switch = false;
+	if (mps->active_slot) {
+		mps->active_slot->ended = false;
+		mps->active_slot->ended_handled = true;
+	}
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+
+	pthread_mutex_lock(&mps->mutex);
+	struct media_file_data *avoid = NULL;
+	if (mps->activation_first_id) {
+		struct media_file_data previous = {
+			.id = mps->activation_first_id,
+			.parent_id = mps->activation_first_filename ? mps->activation_first_id : NULL,
+			.filename = mps->activation_first_filename,
+		};
+		size_t index = find_media_index(&mps->shuffler.shuffled_files.da, &previous, 0);
+		if (index != DARRAY_INVALID)
+			avoid = mps->shuffler.shuffled_files.array[index];
+	}
+	shuffler_reshuffle_avoid(&mps->shuffler, avoid);
+	invalidate_shuffle_cycle_exhausted(mps);
+	pthread_mutex_unlock(&mps->mutex);
+
+	/* Consume exactly once, using the normal folder/index and switch handling. */
+	mps_playlist_next(mps);
+	pthread_mutex_lock(&mps->mutex);
+	bfree(mps->activation_first_id);
+	bfree(mps->activation_first_filename);
+	mps->activation_first_id = NULL;
+	mps->activation_first_filename = NULL;
+	if (mps->actual_media) {
+		struct media_file_data *first = mps->actual_media;
+		mps->activation_first_id = bstrdup(first->parent_id ? first->parent_id : first->id);
+		if (first->parent_id)
+			mps->activation_first_filename = bstrdup(first->filename);
+	}
+	pthread_mutex_unlock(&mps->mutex);
+}
+
 static void mps_activate(void *data)
 {
 	struct media_playlist_source *mps = data;
-	if (!get_total_file_count(mps))
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	bool was_active = mps->source_active;
+	mps->source_active = true;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (was_active)
 		return;
+
+	pthread_mutex_lock(&mps->mutex);
+	bool has_files = get_total_file_count(mps) > 0;
+	bool fresh = mps->shuffle && mps->shuffle_reset_behavior == SHUFFLE_RESET_ON_ACTIVATE;
+	pthread_mutex_unlock(&mps->mutex);
+	if (!has_files)
+		return;
+	if (fresh) {
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		mps->fresh_shuffle_pending = true;
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		activate_fresh_shuffle(mps);
+		return;
+	}
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	if (mps->active_slot) {
@@ -1637,6 +2177,11 @@ static void mps_activate(void *data)
 static void mps_deactivate(void *data)
 {
 	struct media_playlist_source *mps = data;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	mps->source_active = false;
+	mps->fresh_shuffle_pending = false;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
 
 	if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_STOP_RESTART) {
 		obs_source_media_stop(mps->source);
@@ -1668,9 +2213,16 @@ static void mps_destroy(void *data)
 	destroy_media_slot(&mps->media_slots[0]);
 	destroy_media_slot(&mps->media_slots[1]);
 	shuffler_destroy(&mps->shuffler);
+	mps_duration_inventory_destroy(mps->duration_inventory);
+	bfree(mps->telemetry_meaning.item_id);
+	bfree(mps->telemetry_meaning.file);
+	bfree(mps->telemetry_meaning.source_name);
 	free_files(&mps->files.da);
 	bfree(mps->logical_next_path);
+	bfree(mps->activation_first_id);
+	bfree(mps->activation_first_filename);
 	bfree(mps->source_uuid);
+	pthread_mutex_destroy(&mps->telemetry_mutex);
 	pthread_mutex_destroy(&mps->mutex);
 	pthread_mutex_destroy(&mps->audio_mutex);
 	pthread_mutex_destroy(&mps->lifecycle_mutex);
@@ -1691,14 +2243,18 @@ static void *mps_create(obs_data_t *settings, obs_source_t *source)
 	pthread_mutex_init_value(&mps->mutex);
 	pthread_mutex_init_value(&mps->audio_mutex);
 	pthread_mutex_init_value(&mps->lifecycle_mutex);
+	pthread_mutex_init_value(&mps->telemetry_mutex);
 	if (pthread_mutex_init(&mps->lifecycle_mutex, NULL) != 0)
 		goto allocation_error;
 	if (pthread_mutex_init(&mps->audio_mutex, NULL) != 0)
 		goto audio_mutex_error;
 	if (pthread_mutex_init(&mps->mutex, NULL) != 0)
 		goto mutex_error;
+	if (pthread_mutex_init(&mps->telemetry_mutex, NULL) != 0)
+		goto telemetry_mutex_error;
 
 	shuffler_init(&mps->shuffler);
+	mps->duration_inventory = mps_duration_inventory_create();
 	mps_coordinator_init(&mps->coordinator);
 	for (size_t i = 0; i < 2; i++)
 		mps->media_slots[i].owner = mps;
@@ -1728,6 +2284,8 @@ static void *mps_create(obs_data_t *settings, obs_source_t *source)
 	mps_registry_add(mps);
 	return mps;
 
+telemetry_mutex_error:
+	pthread_mutex_destroy(&mps->mutex);
 mutex_error:
 	pthread_mutex_destroy(&mps->audio_mutex);
 audio_mutex_error:
@@ -2110,7 +2668,12 @@ static bool activate_and_cut(struct media_playlist_source *mps, struct media_sou
 		destroy_media_slot(old_slot);
 	mps->paused = false;
 	set_media_state(mps, OBS_MEDIA_STATE_PLAYING);
+	/* The prefetch below may auto-reshuffle a just-finished shuffle cycle, so
+	 * remember that this generation ended its cycle while the cursor is still
+	 * at the end. */
+	record_shuffle_cycle_exhausted(mps, slot);
 	prepare_next_media(mps);
+	mps_playlist_change_notify(mps);
 	return true;
 }
 
@@ -2287,6 +2850,28 @@ static void mps_video_tick(void *data, float seconds)
 	UNUSED_PARAMETER(seconds);
 	obs_source_t *active_source = get_active_source_ref(mps);
 	if (active_source) {
+		/* Child media actions are queued by OBS. In particular there is no
+		 * seek-completed signal: observe applied idle-clock changes in this
+		 * existing lifecycle tick, without a second timer or guessed cursor.
+		 * Playing-clock progress never wakes the publisher here. */
+		enum obs_media_state clock_state = obs_source_media_get_state(active_source);
+		bool idle_clock = clock_state == OBS_MEDIA_STATE_PAUSED || clock_state == OBS_MEDIA_STATE_STOPPED ||
+				  clock_state == OBS_MEDIA_STATE_ENDED;
+		int64_t idle_ms = idle_clock ? obs_source_media_get_time(active_source) : -1;
+		bool changed = false;
+		pthread_mutex_lock(&mps->lifecycle_mutex);
+		if (mps->active_slot && mps->active_slot->source == active_source) {
+			uint64_t generation = mps->active_slot->source_generation;
+			changed = mps->telemetry_clock_generation != generation ||
+				  mps->telemetry_clock_state != clock_state ||
+				  (idle_clock && mps->telemetry_idle_clock_ms != idle_ms);
+			mps->telemetry_clock_generation = generation;
+			mps->telemetry_clock_state = clock_state;
+			mps->telemetry_idle_clock_ms = idle_ms;
+		}
+		pthread_mutex_unlock(&mps->lifecycle_mutex);
+		if (changed)
+			mps_playlist_change_notify(mps);
 		if (obs_source_get_width(active_source) && obs_source_get_height(active_source)) {
 			pthread_mutex_lock(&mps->lifecycle_mutex);
 			if (mps->active_slot && mps->active_slot->source == active_source)
@@ -2300,6 +2885,7 @@ static void mps_video_tick(void *data, float seconds)
 	resetting = mps->resetting;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
 	if (!resetting) {
+		activate_fresh_shuffle(mps);
 		process_slot_events(mps);
 		prepare_requested_media(mps);
 		pthread_mutex_lock(&mps->lifecycle_mutex);
@@ -2464,6 +3050,7 @@ static void mps_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_bool(settings, S_LOOP, true);
 	obs_data_set_default_bool(settings, S_SHUFFLE, false);
+	obs_data_set_default_int(settings, S_SHUFFLE_RESET_BEHAVIOR, SHUFFLE_RESET_PRESERVE);
 	obs_data_set_default_int(settings, S_VISIBILITY_BEHAVIOR, VISIBILITY_BEHAVIOR_STOP_RESTART);
 	obs_data_set_default_int(settings, S_RESTART_BEHAVIOR, RESTART_BEHAVIOR_CURRENT_FILE);
 	obs_data_set_default_string(settings, S_CURRENT_FILE_NAME, " ");
@@ -2524,6 +3111,10 @@ static obs_properties_t *mps_properties(void *data)
 
 	obs_properties_add_bool(props, S_LOOP, T_LOOP);
 	obs_properties_add_bool(props, S_SHUFFLE, T_SHUFFLE);
+	p = obs_properties_add_list(props, S_SHUFFLE_RESET_BEHAVIOR, T_SHUFFLE_RESET_BEHAVIOR, OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, T_SHUFFLE_RESET_PRESERVE, SHUFFLE_RESET_PRESERVE);
+	obs_property_list_add_int(p, T_SHUFFLE_RESET_ON_ACTIVATE, SHUFFLE_RESET_ON_ACTIVATE);
 
 	// get last directory opened for editable list
 	if (mps) {
@@ -2669,6 +3260,53 @@ static void add_file(struct darray *array, const char *path, const char *id)
 	*array = new_files.da;
 }
 
+/* mps_duration_inventory_set_paths() copies the paths itself, so the playlist
+ * lock is released first while the temporary copies keep the pointers valid.
+ * Copying stops at the inventory's per-source entry bound. */
+static char *copy_inventory_path(const char *path)
+{
+	if (!path || !*path || !memchr(path, '\0', MPS_DURATION_INVENTORY_MAX_PATH_BYTES))
+		return NULL;
+	return bstrdup(path);
+}
+
+static void update_duration_inventory(struct media_playlist_source *mps)
+{
+	size_t visited = 0;
+	DARRAY(char *) paths;
+	da_init(paths);
+
+	pthread_mutex_lock(&mps->mutex);
+	for (size_t i = 0; i < mps->files.num && i < MPS_DURATION_INVENTORY_MAX_ENTRIES &&
+			   visited < MPS_DURATION_INVENTORY_MAX_ENTRIES;
+	     ++i) {
+		struct media_file_data *media = &mps->files.array[i];
+		if (media->is_folder) {
+			for (size_t j = 0; j < media->folder_items.num && visited < MPS_DURATION_INVENTORY_MAX_ENTRIES;
+			     ++j) {
+				++visited;
+				const char *path = media->folder_items.array[j].path;
+				char *copy = copy_inventory_path(path);
+				if (copy)
+					da_push_back(paths, &copy);
+				if (paths.num >= MPS_DURATION_INVENTORY_MAX_ENTRIES)
+					break;
+			}
+		} else {
+			++visited;
+			char *copy = copy_inventory_path(media->path);
+			if (copy)
+				da_push_back(paths, &copy);
+		}
+	}
+	pthread_mutex_unlock(&mps->mutex);
+
+	mps_duration_inventory_set_paths(mps->duration_inventory, (const char *const *)paths.array, paths.num);
+	for (size_t i = 0; i < paths.num; ++i)
+		bfree(paths.array[i]);
+	da_free(paths);
+}
+
 static void mps_update(void *data, obs_data_t *settings)
 {
 	DARRAY(struct media_file_data) new_files;
@@ -2704,7 +3342,9 @@ static void mps_update(void *data, obs_data_t *settings)
 	mps->restart_behavior = obs_data_get_int(settings, S_RESTART_BEHAVIOR);
 	shuffle = obs_data_get_bool(settings, S_SHUFFLE);
 	new_speed = obs_data_get_int(settings, S_SPEED);
+	pthread_mutex_lock(&mps->mutex);
 	mps->speed = new_speed;
+	pthread_mutex_unlock(&mps->mutex);
 
 	/* Internal media source settings */
 	mps->use_hw_decoding = obs_data_get_bool(settings, S_FFMPEG_HW_DECODE);
@@ -2729,9 +3369,13 @@ static void mps_update(void *data, obs_data_t *settings)
 		obs_data_release(media_source_settings);
 		obs_source_release(media_source);
 	}
-	mps->state = obs_source_media_get_state(mps->source);
+	/* mps_get_state() reports NONE when no child is committed; do not erase a
+	 * meaningful cached state in that window. */
+	enum obs_media_state observed_state = mps_get_state(mps);
+	if (observed_state != OBS_MEDIA_STATE_NONE)
+		set_media_state(mps, observed_state);
 	if (visibility_behavior_changed && !obs_source_active(mps->source) &&
-	    (mps->state == OBS_MEDIA_STATE_PLAYING || mps->state == OBS_MEDIA_STATE_PAUSED)) {
+	    (observed_state == OBS_MEDIA_STATE_PLAYING || observed_state == OBS_MEDIA_STATE_PAUSED)) {
 		mps_deactivate(mps);
 	}
 
@@ -2745,6 +3389,7 @@ static void mps_update(void *data, obs_data_t *settings)
 	pthread_mutex_lock(&mps->mutex);
 	shuffle_changed = mps->shuffle != shuffle;
 	mps->shuffle = shuffle;
+	mps->shuffle_reset_behavior = obs_data_get_int(settings, S_SHUFFLE_RESET_BEHAVIOR);
 	mps->loop = obs_data_get_bool(settings, S_LOOP);
 	shuffler_set_loop(&mps->shuffler, mps->loop);
 	if (!mps->first_update && mps->current_media)
@@ -2828,13 +3473,18 @@ static void mps_update(void *data, obs_data_t *settings)
 				empty_folder = true;
 			} else {
 				set_current_folder_item_index(mps, mps->current_folder_item_index);
-				if (mps->shuffle)
-					shuffler_select(&mps->shuffler, mps->actual_media);
 			}
 		} else {
 			mps->actual_media = mps->current_media;
-			if (mps->shuffle)
-				shuffler_select(&mps->shuffler, mps->actual_media);
+		}
+
+		if (mps->shuffle && !empty_folder && !item_edited) {
+			struct shuffler *s = &mps->shuffler;
+			size_t current = s->next ? s->next - 1 : s->shuffled_files.num - 1;
+			/* Rebinding an unchanged current item is not a manual selection:
+			 * moving it past a peeked next item would silently skip that item. */
+			if (!(s->next || s->head) || s->shuffled_files.array[current] != mps->actual_media)
+				shuffler_select(s, mps->actual_media);
 		}
 
 		should_switch = mps->first_update || !found || item_edited || transition_pending;
@@ -2884,7 +3534,11 @@ static void mps_update(void *data, obs_data_t *settings)
 	//	obs_source_media_started(mps->source);
 	//}
 	obs_data_array_release(array);
+	/* set_paths() copies the paths, so only the temporary copies below keep the
+	 * call outside the playlist lock; probing stays on the inventory worker. */
+	update_duration_inventory(mps);
 	mps->first_update = false;
+	invalidate_shuffle_cycle_exhausted(mps);
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	mps->resetting = false;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
