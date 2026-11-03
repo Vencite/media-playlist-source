@@ -367,6 +367,11 @@ static obs_source_t *create_source(const char *id, const char *name)
 	return source;
 }
 
+static void destroy_queue_barrier(void *data)
+{
+	(void)data;
+}
+
 static void reset_fixtures(void)
 {
 	mps_playlist_vendor_stop(MPS_VENDOR_STOP_FRONTEND_EXIT);
@@ -374,6 +379,12 @@ static void reset_fixtures(void)
 	for (size_t i = 0; i < created_sources.num; i++)
 		obs_source_release(created_sources.array[i]);
 	da_free(created_sources);
+
+	/* Source release queues asynchronous destruction (including hotkeys).
+	 * Headless OBS has no audio/video workers, so obs_wait_for_destroy_queue()
+	 * returns without draining it. Finish these tasks before reusing fixtures
+	 * or letting obs_shutdown() free the global hotkey state. */
+	obs_queue_task(OBS_TASK_DESTROY, destroy_queue_barrier, NULL, true);
 
 	for (size_t i = 0; i < websocket.events.num; i++)
 		obs_data_release(websocket.events.array[i]);
