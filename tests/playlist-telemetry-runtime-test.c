@@ -527,34 +527,37 @@ static void test_sequential_folder_duplicates_and_loop(void)
 {
 	char folder[1024];
 	char dup_path[1200];
-	char child_one[1200];
-	char child_two[1200];
-
 	create_temp_media_folder(folder, sizeof(folder), dup_path, sizeof(dup_path));
-	snprintf(child_one, sizeof(child_one), "%s/one.mp3", folder);
-	snprintf(child_two, sizeof(child_two), "%s/two.mp3", folder);
 
 	const char *paths[] = {folder, dup_path, dup_path};
 	const char *ids[] = {"id-folder", "id-dup-one", "id-dup-two"};
 
 	fake_durations_reset();
-	fake_duration_set(child_two, 20000);
 	fake_duration_set(dup_path, 5000);
 
 	obs_source_t *source = create_playlist(paths, ids, 3, false, true, 100);
 	struct media_playlist_source *mps = obs_obj_get_data(source);
+	/* os_readdir order is not guaranteed. Exercise the actual first/second
+	 * entries without imposing a filesystem-dependent alphabetical order. */
+	assert(mps->files.array[0].folder_items.num == 2);
+	struct media_file_data *children = mps->files.array[0].folder_items.array;
+	assert(strcmp(children[0].filename, "one.mp3") == 0 || strcmp(children[0].filename, "two.mp3") == 0);
+	assert(strcmp(children[0].filename, children[1].filename) != 0);
+	fake_duration_set(children[1].path, 20000);
 	pump(mps);
 	set_current_clock(mps, 0, 10000);
 
 	struct mps_playlist_telemetry snapshot;
 	get_snapshot(source, &snapshot);
 	assert(snapshot.current_item_id);
-	assert(strcmp(snapshot.current_item_id, "id-folder/one.mp3") == 0);
+	assert(strncmp(snapshot.current_item_id, "id-folder/", strlen("id-folder/")) == 0);
+	assert(strcmp(snapshot.current_item_id + strlen("id-folder/"), children[0].filename) == 0);
+	assert(strcmp(snapshot.current_path, children[0].path) == 0);
 	assert(snapshot.playlist_index == 0);
 	assert(snapshot.folder_item_index == 0);
 	assert(snapshot.items_remaining == 3);
 	assert(snapshot.playlist_remaining_known);
-	/* Current 10000 + two.mp3 20000 + dup 5000 + duplicate entry 5000. Loop
+	/* Current 10000 + second folder item 20000 + dup 5000 + duplicate entry 5000. Loop
 	 * on must not add another pass. */
 	assert(snapshot.playlist_remaining_ms == 40000);
 	assert(snapshot.remaining_ms == 10000);
