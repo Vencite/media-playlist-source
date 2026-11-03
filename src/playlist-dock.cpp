@@ -437,9 +437,6 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	remaining_value_ = make_secondary_label(QStringLiteral("--:--"), this);
 	context_layout->addWidget(elapsed_value_, 6, 1);
 	context_layout->addWidget(remaining_value_, 6, 2);
-	context_layout->addWidget(make_section_label(tr("Playlist remaining"), this), 7, 1);
-	playlist_remaining_value_ = make_secondary_label(QStringLiteral("--:--"), this);
-	context_layout->addWidget(playlist_remaining_value_, 7, 2);
 	context_layout->addWidget(make_separator(this), 8, 0, 1, 3);
 
 	context_layout->addWidget(make_section_icon(QStyle::SP_MediaSkipForward, this), 9, 0);
@@ -450,6 +447,12 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	context_layout->addWidget(next_value_, 10, 1, 1, 2);
 	layout->addLayout(context_layout);
 	layout->addStretch();
+	auto *remaining_layout = new QHBoxLayout;
+	remaining_layout->addWidget(make_section_label(tr("Playlist remaining"), this));
+	remaining_layout->addStretch();
+	playlist_remaining_value_ = make_secondary_label(QStringLiteral("--:--"), this);
+	remaining_layout->addWidget(playlist_remaining_value_);
+	layout->addLayout(remaining_layout);
 
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
