@@ -551,29 +551,39 @@ done:
 	return resolved;
 }
 
-static void vendor_request_get_playlist_state(obs_data_t *request, obs_data_t *response, void *unused)
+static bool vendor_request_begin(obs_data_t *response)
 {
-	const char *code = NULL;
-	const char *message = NULL;
-	obs_source_t *source;
-	obs_data_t *snapshot;
 	bool accepting;
-
-	(void)unused;
 
 	pthread_mutex_lock(&vendor_mutex);
 	accepting = vendor.accepting;
 	if (accepting)
 		++vendor.active_requests;
 	pthread_mutex_unlock(&vendor_mutex);
-
-	if (!accepting) {
-		/* obs-websocket has no vendor unregister and keeps callbacks that were
-		 * dispatched around module shutdown. Answer without touching OBS or
-		 * obs-websocket so a stopped vendor can never reach a dead proc handler. */
+	if (!accepting)
 		vendor_respond_error(response, "unavailable", "media playlist vendor is not running");
+	return accepting;
+}
+
+static void vendor_request_end(void)
+{
+	pthread_mutex_lock(&vendor_mutex);
+	--vendor.active_requests;
+	pthread_mutex_unlock(&vendor_mutex);
+	os_event_signal(vendor.event);
+}
+
+static void vendor_request_get_playlist_state(obs_data_t *request, obs_data_t *response, void *unused)
+{
+	const char *code = NULL;
+	const char *message = NULL;
+	obs_source_t *source;
+	obs_data_t *snapshot;
+
+	(void)unused;
+
+	if (!vendor_request_begin(response))
 		return;
-	}
 
 	source = vendor_resolve_source(request, &code, &message);
 	if (!source) {
@@ -595,12 +605,210 @@ release_source:
 	obs_source_release(source);
 
 done:
-	pthread_mutex_lock(&vendor_mutex);
-	--vendor.active_requests;
-	pthread_mutex_unlock(&vendor_mutex);
-	/* Wakes stop()'s drain loop; safe after stop because the event outlives the vendor. */
-	os_event_signal(vendor.event);
+	vendor_request_end();
 }
+
+static bool vendor_read_integer(obs_data_t *request, const char *key, long long fallback, long long *value)
+{
+	*value = fallback;
+	if (!obs_data_has_user_value(request, key))
+		return true;
+	obs_data_item_t *item = obs_data_item_byname(request, key);
+	bool valid = item && obs_data_item_gettype(item) == OBS_DATA_NUMBER &&
+		     obs_data_item_numtype(item) == OBS_DATA_NUM_INT;
+	obs_data_item_release(&item);
+	if (!valid)
+		return false;
+	*value = obs_data_get_int(request, key);
+	return *value >= 0;
+}
+
+static const char *vendor_entry_filename(const struct mps_playlist_item_snapshot *entry)
+{
+	if (entry->filename)
+		return entry->filename;
+	const char *path = entry->path ? entry->path : "";
+	const char *base = path;
+	for (const char *cursor = path; *cursor; cursor++) {
+		if ((*cursor == '/' || *cursor == '\\') && cursor[1])
+			base = cursor + 1;
+	}
+	return base;
+}
+
+static void vendor_get_playlist_entries(obs_source_t *source, obs_data_t *request, obs_data_t *response)
+{
+	long long offset, limit, revision;
+	bool revision_present = obs_data_has_user_value(request, "playlist_revision");
+	if (!vendor_read_integer(request, "offset", 0, &offset) ||
+	    !vendor_read_integer(request, "limit", 100, &limit) || limit < 1 || limit > 200 ||
+	    !vendor_read_integer(request, "playlist_revision", 0, &revision) || (revision_present && revision == 0) ||
+	    (offset > 0 && !revision_present) || (uint64_t)offset > SIZE_MAX) {
+		vendor_respond_error(response, "invalid", "offset, limit or playlist_revision is invalid");
+		return;
+	}
+	struct mps_playlist_entries_snapshot snapshot = {0};
+	if (!mps_playlist_entries_page_get(source, (size_t)offset, (size_t)limit, &snapshot)) {
+		vendor_respond_error(response, "unavailable", "playlist entries are not available");
+		return;
+	}
+	if (revision_present && (uint64_t)revision != snapshot.playlist_revision) {
+		vendor_respond_error(response, "stale", "playlist changed; restart pagination");
+		goto done;
+	}
+	if (snapshot.total_count > INT64_MAX || snapshot.item_count > INT64_MAX ||
+	    snapshot.playlist_revision > INT64_MAX) {
+		vendor_respond_error(response, "unavailable", "playlist exceeds response limits");
+		goto done;
+	}
+	obs_data_array_t *entries = obs_data_array_create();
+	for (size_t i = 0; i < snapshot.item_count; i++) {
+		const struct mps_playlist_item_snapshot *entry = &snapshot.items[i];
+		obs_data_t *item = obs_data_create();
+		if (entry->stable_id && *entry->stable_id)
+			obs_data_set_string(item, "item_id", entry->stable_id);
+		obs_data_set_string(item, "filename", vendor_entry_filename(entry));
+		if (entry->path)
+			obs_data_set_string(item, "path", entry->path);
+		obs_data_set_int(item, "playlist_index", (long long)entry->media_index);
+		if (entry->is_folder_child)
+			obs_data_set_int(item, "folder_item_index", (long long)entry->folder_item_index);
+		obs_data_set_bool(item, "is_folder", entry->is_folder);
+		obs_data_set_bool(item, "selectable", !entry->is_folder && entry->stable_id && *entry->stable_id);
+		obs_data_set_bool(item, "is_selected", entry->is_current);
+		obs_data_array_push_back(entries, item);
+		obs_data_release(item);
+	}
+	bool has_more = snapshot.offset < snapshot.total_count &&
+			snapshot.item_count < snapshot.total_count - snapshot.offset;
+	obs_data_set_bool(response, "success", true);
+	obs_data_set_int(response, "schema_version", 1);
+	obs_data_set_string(response, "source_uuid", obs_source_get_uuid(source));
+	obs_data_set_string(response, "source_name", obs_source_get_name(source));
+	obs_data_set_int(response, "playlist_revision", (long long)snapshot.playlist_revision);
+	obs_data_set_int(response, "total_count", (long long)snapshot.total_count);
+	obs_data_set_int(response, "offset", offset);
+	obs_data_set_int(response, "count", (long long)snapshot.item_count);
+	obs_data_set_bool(response, "has_more", has_more);
+	obs_data_set_bool(response, "shuffle", snapshot.shuffle);
+	obs_data_set_bool(response, "loop", snapshot.loop);
+	if (has_more)
+		obs_data_set_int(response, "next_offset", offset + (long long)snapshot.item_count);
+	obs_data_set_array(response, "entries", entries);
+	obs_data_array_release(entries);
+done:
+	mps_playlist_entries_snapshot_free(&snapshot);
+}
+
+struct mps_vendor_selection {
+	obs_source_t *source;
+	const char *item_id;
+	uint64_t revision;
+	bool accepted;
+};
+
+static void vendor_select_on_graphics(void *data)
+{
+	struct mps_vendor_selection *selection = data;
+	pthread_mutex_lock(&vendor_mutex);
+	bool accepting = vendor.accepting;
+	pthread_mutex_unlock(&vendor_mutex);
+	selection->accepted = accepting && !obs_source_removed(selection->source) &&
+			      mps_playlist_select_item(selection->source, selection->item_id, selection->revision);
+}
+
+static void vendor_select_playlist_item(obs_source_t *source, obs_data_t *request, obs_data_t *response)
+{
+	bool present = false;
+	const char *item_id = NULL, *code = NULL, *message = NULL;
+	long long revision;
+	if (!vendor_read_identifier(request, "item_id", &present, &item_id, &code, &message) || !present ||
+	    strlen(item_id) > 4096 || !vendor_read_integer(request, "playlist_revision", 0, &revision) ||
+	    (obs_data_has_user_value(request, "playlist_revision") && revision == 0)) {
+		vendor_respond_error(response, "invalid", "item_id or playlist_revision is invalid");
+		return;
+	}
+	struct obs_video_info video;
+	if (!obs_get_video_info(&video)) {
+		vendor_respond_error(response, "unavailable", "OBS video thread is not running");
+		return;
+	}
+	struct mps_vendor_selection selection = {.source = source, .item_id = item_id, .revision = (uint64_t)revision};
+	/* The request retains source and item_id until this synchronous task completes. */
+	obs_queue_task(OBS_TASK_GRAPHICS, vendor_select_on_graphics, &selection, true);
+	if (!selection.accepted) {
+		vendor_respond_error(response, "invalid_or_stale", "playlist item is unavailable or changed");
+		return;
+	}
+	obs_data_set_bool(response, "success", true);
+	obs_data_set_bool(response, "accepted", true);
+}
+
+static void vendor_set_playback_options(obs_source_t *source, obs_data_t *request, obs_data_t *response)
+{
+	bool shuffle = obs_data_has_user_value(request, "shuffle");
+	bool loop = obs_data_has_user_value(request, "loop");
+	if (!shuffle && !loop) {
+		vendor_respond_error(response, "invalid", "shuffle or loop is required");
+		return;
+	}
+	const char *keys[] = {"shuffle", "loop"};
+	for (size_t i = 0; i < 2; i++) {
+		if (!obs_data_has_user_value(request, keys[i]))
+			continue;
+		obs_data_item_t *item = obs_data_item_byname(request, keys[i]);
+		bool valid = item && obs_data_item_gettype(item) == OBS_DATA_BOOLEAN;
+		obs_data_item_release(&item);
+		if (!valid) {
+			vendor_respond_error(response, "invalid", "playback options must be booleans");
+			return;
+		}
+	}
+	if (obs_source_removed(source)) {
+		vendor_respond_error(response, "unavailable", "playlist source was removed");
+		return;
+	}
+	obs_data_t *settings = obs_data_create();
+	if (shuffle)
+		obs_data_set_bool(settings, "shuffle", obs_data_get_bool(request, "shuffle"));
+	if (loop)
+		obs_data_set_bool(settings, "loop", obs_data_get_bool(request, "loop"));
+	obs_source_update(source, settings);
+	obs_data_release(settings);
+	obs_data_set_bool(response, "success", true);
+	obs_data_set_bool(response, "accepted", true);
+}
+
+static void vendor_request_playlist(obs_data_t *request, obs_data_t *response, void *type)
+{
+	if (!vendor_request_begin(response))
+		return;
+	const char *code = NULL, *message = NULL;
+	obs_source_t *source = vendor_resolve_source(request, &code, &message);
+	if (!source) {
+		vendor_respond_error(response, code, message);
+	} else {
+		if (strcmp(type, MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES) == 0)
+			vendor_get_playlist_entries(source, request, response);
+		else if (strcmp(type, MPS_VENDOR_REQUEST_SELECT_PLAYLIST_ITEM) == 0)
+			vendor_select_playlist_item(source, request, response);
+		else
+			vendor_set_playback_options(source, request, response);
+		obs_source_release(source);
+	}
+	vendor_request_end();
+}
+
+static const struct {
+	const char *name;
+	obs_websocket_request_callback_function callback;
+	void *data;
+} vendor_requests[] = {
+	{MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE, vendor_request_get_playlist_state, NULL},
+	{MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES, vendor_request_playlist, MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES},
+	{MPS_VENDOR_REQUEST_SELECT_PLAYLIST_ITEM, vendor_request_playlist, MPS_VENDOR_REQUEST_SELECT_PLAYLIST_ITEM},
+	{MPS_VENDOR_REQUEST_SET_PLAYBACK_OPTIONS, vendor_request_playlist, MPS_VENDOR_REQUEST_SET_PLAYBACK_OPTIONS},
+};
 
 void mps_playlist_vendor_set_manual_scheduling(bool manual)
 {
@@ -640,9 +848,11 @@ void mps_playlist_vendor_start(void)
 	vendor.accepting = true;
 	pthread_mutex_unlock(&vendor_mutex);
 
-	if (!obs_websocket_vendor_register_request(handle, MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE,
-						   vendor_request_get_playlist_state, NULL))
-		obs_log(LOG_WARNING, "failed to register %s request", MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE);
+	for (size_t i = 0; i < sizeof(vendor_requests) / sizeof(vendor_requests[0]); i++) {
+		if (!obs_websocket_vendor_register_request(handle, vendor_requests[i].name, vendor_requests[i].callback,
+							   vendor_requests[i].data))
+			obs_log(LOG_WARNING, "failed to register %s request", vendor_requests[i].name);
+	}
 
 	mps_playlist_change_add_listener(vendor_playlist_changed, NULL);
 	vendor_connect_signals();
@@ -706,9 +916,13 @@ void mps_playlist_vendor_stop(enum mps_vendor_stop_mode mode)
 	 * accepting fence above answers "unavailable" instead. */
 	if (mode == MPS_VENDOR_STOP_FRONTEND_EXIT && vendor.handle) {
 		_ph = NULL;
-		if (obs_websocket_ensure_ph() &&
-		    !obs_websocket_vendor_unregister_request(vendor.handle, MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE))
-			obs_log(LOG_WARNING, "failed to unregister %s request", MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE);
+		if (obs_websocket_ensure_ph()) {
+			for (size_t i = 0; i < sizeof(vendor_requests) / sizeof(vendor_requests[0]); i++) {
+				if (!obs_websocket_vendor_unregister_request(vendor.handle, vendor_requests[i].name))
+					obs_log(LOG_WARNING, "failed to unregister %s request",
+						vendor_requests[i].name);
+			}
+		}
 	}
 	vendor.handle = NULL;
 

@@ -15,6 +15,7 @@
 !.gersemirc
 !.gitignore
 /AGENTS.md
+/LOCAL-TODO.md
 
 # Exclude agent and AI work files
 AGENT.md

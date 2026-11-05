@@ -378,20 +378,37 @@ void mps_playlist_context_snapshot_free(struct mps_playlist_context_snapshot *sn
 
 bool mps_playlist_entries_snapshot_get(obs_source_t *source, struct mps_playlist_entries_snapshot *snapshot)
 {
+	return mps_playlist_entries_page_get(source, 0, SIZE_MAX, snapshot);
+}
+
+bool mps_playlist_entries_page_get(obs_source_t *source, size_t offset, size_t limit,
+				   struct mps_playlist_entries_snapshot *snapshot)
+{
 	struct media_playlist_source *mps;
 	bool copied;
 
 	if (!source || !snapshot)
 		return false;
 	*snapshot = (struct mps_playlist_entries_snapshot){0};
+	if (obs_source_removed(source))
+		return false;
 
 	mps = mps_registry_lookup(source);
 	if (!mps)
 		return false;
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	bool unavailable = mps->destroying || mps->resetting;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (unavailable)
+		return false;
 
 	pthread_mutex_lock(&mps->mutex);
 	snapshot->shuffle = mps->shuffle;
-	copied = mps_playlist_entries_copy(&mps->files.da, mps->actual_media, &snapshot->items, &snapshot->item_count);
+	snapshot->loop = mps->loop;
+	snapshot->offset = offset;
+	snapshot->playlist_revision = mps->playlist_revision;
+	copied = mps_playlist_entries_copy_range(&mps->files.da, mps->actual_media, offset, limit, &snapshot->items,
+						 &snapshot->item_count, &snapshot->total_count);
 	pthread_mutex_unlock(&mps->mutex);
 	if (!copied) {
 		mps_playlist_entries_snapshot_free(snapshot);
@@ -1433,6 +1450,67 @@ static void select_index_proc_(struct media_playlist_source *mps, size_t media_i
 		pthread_mutex_unlock(&mps->mutex);
 		mps_playlist_change_notify(mps);
 	}
+}
+
+static bool media_has_stable_id(const struct media_file_data *media, const char *stable_id)
+{
+	if (media->id)
+		return strcmp(media->id, stable_id) == 0;
+	if (!media->parent_id || !media->filename)
+		return false;
+
+	size_t parent_length = strlen(media->parent_id);
+	return strncmp(stable_id, media->parent_id, parent_length) == 0 && stable_id[parent_length] == '/' &&
+	       strcmp(stable_id + parent_length + 1, media->filename) == 0;
+}
+
+bool mps_playlist_select_item(obs_source_t *source, const char *stable_id, uint64_t expected_revision)
+{
+	if (!source || !stable_id || !*stable_id || obs_source_removed(source))
+		return false;
+	struct media_playlist_source *mps = mps_registry_lookup(source);
+	if (!mps)
+		return false;
+
+	pthread_mutex_lock(&mps->lifecycle_mutex);
+	bool unavailable = mps->destroying || mps->resetting;
+	pthread_mutex_unlock(&mps->lifecycle_mutex);
+	if (unavailable)
+		return false;
+
+	size_t media_index = 0;
+	size_t folder_item_index = 0;
+	size_t matches = 0;
+	bool selectable = false;
+	pthread_mutex_lock(&mps->mutex);
+	if (expected_revision && expected_revision != mps->playlist_revision) {
+		pthread_mutex_unlock(&mps->mutex);
+		return false;
+	}
+	for (size_t i = 0; i < mps->files.num; i++) {
+		const struct media_file_data *media = &mps->files.array[i];
+		if (media_has_stable_id(media, stable_id)) {
+			media_index = i;
+			folder_item_index = 0;
+			selectable = !media->is_folder;
+			++matches;
+		}
+		for (size_t j = 0; media->is_folder && j < media->folder_items.num; j++) {
+			if (media_has_stable_id(&media->folder_items.array[j], stable_id)) {
+				media_index = i;
+				folder_item_index = j;
+				selectable = true;
+				++matches;
+			}
+		}
+	}
+	pthread_mutex_unlock(&mps->mutex);
+	if (matches != 1 || !selectable || obs_source_removed(source))
+		return false;
+
+	/* The graphics thread serializes this lookup and dispatch with playlist updates. */
+	select_index_proc_(mps, media_index, folder_item_index);
+	return true;
 }
 
 static void select_index_proc(void *data, calldata_t *cd)
@@ -3434,6 +3512,7 @@ static void mps_update(void *data, obs_data_t *settings)
 	}
 	old_files.da = mps->files.da;
 	mps->files.da = new_files.da;
+	++mps->playlist_revision;
 	free_files(&old_files.da);
 	if (found || mps->first_update) {
 		set_current_media_index(mps, mps->current_media_index);

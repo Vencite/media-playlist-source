@@ -270,10 +270,57 @@ static void test_restart_first_keeps_shuffle_history_coherent(void)
 	obs_source_release(source);
 }
 
+static void test_external_stable_selection_and_revision(void)
+{
+	obs_source_t *source = create_playlist(3, SHUFFLE_RESET_PRESERVE);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	struct mps_playlist_entries_snapshot page = {0};
+	assert(mps_playlist_entries_page_get(source, 1, 1, &page));
+	assert(page.item_count == 1 && page.total_count == 3 && page.playlist_revision > 0);
+	uint64_t revision = page.playlist_revision;
+	char *selected_id = bstrdup(page.items[0].stable_id);
+	mps_playlist_entries_snapshot_free(&page);
+	assert(mps_playlist_select_item(source, selected_id, revision));
+	assert(mps->actual_media == &mps->files.array[1]);
+	assert(mps->coordinator.request == MPS_SWITCH_SELECT);
+	uint64_t generation = mps->coordinator.generation;
+	assert(!mps_playlist_select_item(source, "missing", revision));
+	assert(mps->coordinator.generation == generation);
+	obs_data_t *settings = obs_source_get_settings(source);
+	mps_update(mps, settings);
+	obs_data_release(settings);
+	assert(mps->playlist_revision > revision);
+	generation = mps->coordinator.generation;
+	assert(!mps_playlist_select_item(source, selected_id, revision));
+	assert(mps->coordinator.generation == generation);
+	assert(mps_playlist_select_item(source, selected_id, mps->playlist_revision));
+	bfree(selected_id);
+	obs_source_release(source);
+}
+
+static void test_external_selection_rejects_folder_header(void)
+{
+	obs_source_t *source = create_playlist(2, SHUFFLE_RESET_PRESERVE);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	mps->files.array[0].is_folder = true;
+	uint64_t generation = mps->coordinator.generation;
+	assert(!mps_playlist_select_item(source, mps->files.array[0].id, 0));
+	assert(mps->coordinator.generation == generation);
+	mps->files.array[0].is_folder = false;
+	obs_source_release(source);
+}
+
+static void destroy_queue_barrier(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+}
+
 int main(void)
 {
 	assert(obs_startup("en-US", NULL, NULL));
 	obs_register_source(&media_playlist_source_info);
+	test_external_stable_selection_and_revision();
+	test_external_selection_rejects_folder_header();
 	test_compatibility_default();
 	test_fresh_activation_and_redundant_callback();
 	test_empty_single_and_shuffle_disabled();
@@ -284,6 +331,7 @@ int main(void)
 	test_playlist_update_does_not_consume_prefetched_next();
 	test_folder_activation_and_restart();
 	test_restart_first_keeps_shuffle_history_coherent();
+	obs_queue_task(OBS_TASK_DESTROY, destroy_queue_barrier, NULL, true);
 	obs_shutdown();
 	puts("shuffle activation tests passed");
 	return 0;

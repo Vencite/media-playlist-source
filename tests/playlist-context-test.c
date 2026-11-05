@@ -207,8 +207,40 @@ static void test_playlist_entry_identity_survives_reorder(void)
 	mps_playlist_entries_free(reordered_snapshot, reordered_item_count);
 }
 
+static void test_bounded_pages_and_folder_boundaries(void)
+{
+	struct media_file_data children[2] = {
+		{.parent_id = "folder", .filename = "x.mp4", .path = "folder/x.mp4"},
+		{.parent_id = "folder", .filename = "y.mp4", .path = "folder/y.mp4"},
+	};
+	struct media_file_data files_array[3] = {
+		{.id = "one", .path = "same.mp4"},
+		{.id = "folder", .path = "folder", .is_folder = true},
+		{.id = "two", .path = "same.mp4"},
+	};
+	files_array[1].folder_items.array = children;
+	files_array[1].folder_items.num = 2;
+	struct darray files = {.array = files_array, .num = 3, .capacity = 3};
+	struct mps_playlist_item_snapshot *page = NULL;
+	size_t count = 0, total = 0;
+	assert(mps_playlist_entries_copy_range(&files, &children[1], 2, 2, &page, &count, &total));
+	assert(count == 2 && total == 5);
+	assert(strcmp(page[0].stable_id, "folder/x.mp4") == 0);
+	assert(page[0].is_folder_child && page[0].media_index == 1 && page[0].folder_item_index == 0);
+	assert(page[1].is_current && strcmp(page[1].stable_id, "folder/y.mp4") == 0);
+	mps_playlist_entries_free(page, count);
+	assert(mps_playlist_entries_copy_range(&files, NULL, 4, 200, &page, &count, &total));
+	assert(count == 1 && total == 5 && strcmp(page[0].stable_id, "two") == 0);
+	mps_playlist_entries_free(page, count);
+	assert(mps_playlist_entries_copy_range(&files, NULL, SIZE_MAX, 2, &page, &count, &total));
+	assert(page == NULL && count == 0 && total == 5);
+	assert(mps_playlist_entries_copy_range(&files, NULL, 0, 0, &page, &count, &total));
+	assert(page == NULL && count == 0 && total == 5);
+}
+
 int main(void)
 {
+	test_bounded_pages_and_folder_boundaries();
 	test_empty_playlist();
 	test_sequential_boundaries();
 	test_sequential_loop_wraps();

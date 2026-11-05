@@ -131,45 +131,63 @@ static bool copy_playlist_item_snapshot(struct mps_playlist_item_snapshot *snaps
 bool mps_playlist_entries_copy(const struct darray *files, const struct media_file_data *actual_media,
 			       struct mps_playlist_item_snapshot **items, size_t *item_count)
 {
-	size_t count = 0;
-	size_t output_index = 0;
-	struct mps_playlist_item_snapshot *output;
+	size_t total;
+	return mps_playlist_entries_copy_range(files, actual_media, 0, SIZE_MAX, items, item_count, &total);
+}
 
-	if (!items || !item_count)
+bool mps_playlist_entries_copy_range(const struct darray *files, const struct media_file_data *actual_media,
+				     size_t offset, size_t limit, struct mps_playlist_item_snapshot **items,
+				     size_t *item_count, size_t *total_count)
+{
+	if (!items || !item_count || !total_count)
 		return false;
 	*items = NULL;
 	*item_count = 0;
+	*total_count = 0;
 	if (!files || !files->num)
 		return true;
-
+	if (!files->array)
+		return false;
+	size_t total = 0;
 	for (size_t i = 0; i < files->num; i++) {
 		const struct media_file_data *media = &((const struct media_file_data *)files->array)[i];
-		count += 1 + (media->is_folder ? media->folder_items.num : 0);
+		size_t children = media->is_folder ? media->folder_items.num : 0;
+		if (total == SIZE_MAX || children > SIZE_MAX - total - 1)
+			return false;
+		total += 1 + children;
 	}
-	output = bzalloc(count * sizeof(*output));
+	*total_count = total;
+	if (offset >= total || !limit)
+		return true;
+	size_t count = total - offset;
+	if (count > limit)
+		count = limit;
+	if (count > SIZE_MAX / sizeof(struct mps_playlist_item_snapshot))
+		return false;
+	struct mps_playlist_item_snapshot *output = bzalloc(count * sizeof(*output));
 	if (!output)
 		return false;
-
-	for (size_t i = 0; i < files->num; i++) {
+	size_t cursor = 0;
+	size_t written = 0;
+	for (size_t i = 0; i < files->num && written < count; i++) {
 		const struct media_file_data *media = &((const struct media_file_data *)files->array)[i];
-		if (!copy_playlist_item_snapshot(&output[output_index++], media, i, 0, false, actual_media))
-			goto error;
-		if (media->is_folder) {
-			for (size_t j = 0; j < media->folder_items.num; j++) {
-				const struct media_file_data *child = &media->folder_items.array[j];
-				if (!copy_playlist_item_snapshot(&output[output_index++], child, i, j, true,
-								 actual_media))
+		if (cursor++ >= offset) {
+			if (!copy_playlist_item_snapshot(&output[written++], media, i, 0, false, actual_media))
+				goto error;
+		}
+		for (size_t j = 0; media->is_folder && j < media->folder_items.num && written < count; j++) {
+			if (cursor++ >= offset) {
+				if (!copy_playlist_item_snapshot(&output[written++], &media->folder_items.array[j], i,
+								 j, true, actual_media))
 					goto error;
 			}
 		}
 	}
-
 	*items = output;
-	*item_count = output_index;
+	*item_count = written;
 	return true;
-
 error:
-	mps_playlist_entries_free(output, output_index);
+	mps_playlist_entries_free(output, written);
 	return false;
 }
 

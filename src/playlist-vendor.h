@@ -77,6 +77,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  */
 #define MPS_VENDOR_NAME "media-playlist-source"
 #define MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE "GetPlaylistState"
+#define MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES "GetPlaylistEntries"
+#define MPS_VENDOR_REQUEST_SELECT_PLAYLIST_ITEM "SelectPlaylistItem"
+#define MPS_VENDOR_REQUEST_SET_PLAYBACK_OPTIONS "SetPlaybackOptions"
 #define MPS_VENDOR_EVENT_PLAYLIST_STATE_CHANGED "PlaylistStateChanged"
 
 /* Registers the obs-websocket vendor and request and starts the worker thread.

@@ -56,11 +56,21 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 /* Fake obs-websocket                                                        */
 /* ------------------------------------------------------------------------- */
 
+struct fake_vendor_request {
+	char type[128];
+	obs_websocket_request_callback_function callback;
+	void *priv_data;
+	bool registered;
+};
+
 struct fake_websocket {
 	bool available;
 	proc_handler_t *ph;
 	char vendor_name[128];
 	size_t vendor_register_calls;
+	struct fake_vendor_request requests[4];
+	size_t request_count;
+	size_t request_register_calls;
 	bool request_registered;
 	char request_type[128];
 	obs_websocket_request_callback_function request_callback;
@@ -96,28 +106,38 @@ static void fake_vendor_request_register(void *data, calldata_t *cd)
 {
 	struct obs_websocket_request_callback *callback = calldata_ptr(cd, "callback");
 	const char *type = calldata_string(cd, "type");
-
 	(void)data;
-
-	websocket.request_registered = callback && callback->callback;
-	if (websocket.request_registered) {
-		snprintf(websocket.request_type, sizeof(websocket.request_type), "%s", type ? type : "");
+	CHECK(callback && callback->callback && type);
+	CHECK(websocket.request_count < 4);
+	struct fake_vendor_request *slot = &websocket.requests[websocket.request_count++];
+	snprintf(slot->type, sizeof(slot->type), "%s", type);
+	slot->callback = callback->callback;
+	slot->priv_data = callback->priv_data;
+	slot->registered = true;
+	++websocket.request_register_calls;
+	if (strcmp(type, MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE) == 0) {
+		websocket.request_registered = true;
+		snprintf(websocket.request_type, sizeof(websocket.request_type), "%s", type);
 		websocket.request_callback = callback->callback;
 		websocket.request_priv_data = callback->priv_data;
 	}
-	calldata_set_bool(cd, "success", websocket.request_registered);
+	calldata_set_bool(cd, "success", true);
 }
 
 static void fake_vendor_request_unregister(void *data, calldata_t *cd)
 {
 	const char *type = calldata_string(cd, "type");
-
 	(void)data;
-
 	++websocket.request_unregister_calls;
-	snprintf(websocket.unregistered_type, sizeof(websocket.unregistered_type), "%s", type ? type : "");
-	websocket.request_registered = false;
-	websocket.request_callback = NULL;
+	for (size_t i = 0; i < websocket.request_count; i++) {
+		if (strcmp(websocket.requests[i].type, type) == 0)
+			websocket.requests[i].registered = false;
+	}
+	if (strcmp(type, MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE) == 0) {
+		snprintf(websocket.unregistered_type, sizeof(websocket.unregistered_type), "%s", type);
+		websocket.request_registered = false;
+		websocket.request_callback = NULL;
+	}
 	calldata_set_bool(cd, "success", true);
 }
 
@@ -293,6 +313,46 @@ bool mps_playlist_telemetry_get(obs_source_t *source, struct mps_playlist_teleme
 	return true;
 }
 
+static size_t select_calls;
+
+bool mps_playlist_entries_page_get(obs_source_t *source, size_t offset, size_t limit,
+				   struct mps_playlist_entries_snapshot *snapshot)
+{
+	(void)source;
+	if (telemetry_unavailable)
+		return false;
+	struct media_file_data children[2] = {
+		{.path = "clips/one.mp4", .filename = "one.mp4", .parent_id = "folder"},
+		{.path = "clips/two.mp4", .filename = "two.mp4", .parent_id = "folder"},
+	};
+	struct media_file_data files[3] = {
+		{.id = "entry-a", .path = "a.mp4"},
+		{.id = "folder", .path = "clips", .is_folder = true},
+		{.id = "entry-a-duplicate", .path = "a.mp4"},
+	};
+	files[1].folder_items.array = children;
+	files[1].folder_items.num = 2;
+	struct darray array = {.array = files, .num = 3};
+	*snapshot = (struct mps_playlist_entries_snapshot){.offset = offset, .playlist_revision = 7, .loop = true};
+	return mps_playlist_entries_copy_range(&array, &files[0], offset, limit, &snapshot->items,
+					       &snapshot->item_count, &snapshot->total_count);
+}
+
+void mps_playlist_entries_snapshot_free(struct mps_playlist_entries_snapshot *snapshot)
+{
+	mps_playlist_entries_free(snapshot->items, snapshot->item_count);
+	*snapshot = (struct mps_playlist_entries_snapshot){0};
+}
+
+bool mps_playlist_select_item(obs_source_t *source, const char *stable_id, uint64_t expected_revision)
+{
+	(void)source;
+	(void)stable_id;
+	(void)expected_revision;
+	++select_calls;
+	return true;
+}
+
 static void script_reset(void)
 {
 	mps_playlist_telemetry_init(&scripted);
@@ -396,6 +456,10 @@ static void reset_fixtures(void)
 	websocket.available = true;
 	websocket.vendor_name[0] = '\0';
 	websocket.vendor_register_calls = 0;
+	memset(websocket.requests, 0, sizeof(websocket.requests));
+	websocket.request_count = 0;
+	websocket.request_register_calls = 0;
+	select_calls = 0;
 	websocket.request_registered = false;
 	websocket.request_type[0] = '\0';
 	websocket.request_callback = NULL;
@@ -445,6 +509,23 @@ static char *request_wire(obs_data_t *response)
 static char *event_wire(size_t index)
 {
 	return mps_vendor_wire_vendor_event(MPS_VENDOR_NAME, MPS_VENDOR_EVENT_PLAYLIST_STATE_CHANGED, event_at(index));
+}
+
+static obs_data_t *invoke_named_request(const char *type, const char *request_json)
+{
+	for (size_t i = 0; i < websocket.request_count; i++) {
+		struct fake_vendor_request *entry = &websocket.requests[i];
+		if (entry->registered && strcmp(entry->type, type) == 0) {
+			obs_data_t *request = obs_data_create_from_json(request_json);
+			CHECK(request != NULL);
+			obs_data_t *response = obs_data_create();
+			entry->callback(request, response, entry->priv_data);
+			obs_data_release(request);
+			return response;
+		}
+	}
+	CHECK(false);
+	return NULL;
 }
 
 static obs_data_t *invoke_request(const char *request_json)
@@ -523,6 +604,8 @@ static void test_start_registers_vendor_and_request(void)
 	CHECK(websocket.request_registered);
 	CHECK(strcmp(websocket.request_type, MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE) == 0);
 	CHECK(websocket.request_callback != NULL);
+	CHECK(websocket.request_register_calls == 4);
+	CHECK(websocket.request_count == 4);
 	CHECK(listener_add_calls == 1);
 
 	/* A second start must not register twice. */
@@ -531,7 +614,7 @@ static void test_start_registers_vendor_and_request(void)
 	CHECK(listener_add_calls == 1);
 
 	mps_playlist_vendor_stop(MPS_VENDOR_STOP_FRONTEND_EXIT);
-	CHECK(websocket.request_unregister_calls == 1);
+	CHECK(websocket.request_unregister_calls == 4);
 	CHECK(strcmp(websocket.unregistered_type, MPS_VENDOR_REQUEST_GET_PLAYLIST_STATE) == 0);
 	CHECK(listener_remove_calls == 1);
 }
@@ -1161,6 +1244,204 @@ static void test_stop_before_start_is_safe(void)
 	CHECK(websocket.request_unregister_calls == 0);
 }
 
+static void test_entries_pagination_and_wire(void)
+{
+	reset_fixtures();
+	create_source(fake_playlist_source_id, "Playlist A");
+	start_vendor();
+	obs_data_t *response = invoke_named_request(MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES,
+						    "{\"source_name\":\"Playlist A\",\"limit\":2}");
+	check_request_success(response);
+	CHECK(obs_data_get_int(response, "playlist_revision") == 7);
+	CHECK(obs_data_get_int(response, "total_count") == 5);
+	CHECK(obs_data_get_int(response, "count") == 2);
+	CHECK(obs_data_get_int(response, "next_offset") == 2);
+	CHECK(obs_data_get_bool(response, "has_more"));
+	obs_data_array_t *entries = obs_data_get_array(response, "entries");
+	CHECK(obs_data_array_count(entries) == 2);
+	obs_data_t *folder = obs_data_array_item(entries, 1);
+	CHECK(strcmp(obs_data_get_string(folder, "item_id"), "folder") == 0);
+	CHECK(obs_data_get_bool(folder, "is_folder"));
+	CHECK(!obs_data_get_bool(folder, "selectable"));
+	CHECK(!obs_data_has_user_value(folder, "folder_item_index"));
+	obs_data_release(folder);
+	obs_data_array_release(entries);
+	char *wire =
+		mps_vendor_wire_request_response(MPS_VENDOR_NAME, MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES, response);
+	CHECK(strstr(wire, "\"entries\":[{") != NULL);
+	CHECK(strstr(wire, "\"item_id\":\"entry-a\"") != NULL);
+	CHECK(strstr(wire, "\"is_selected\":true") != NULL);
+	CHECK(strstr(wire, "\"is_current\"") == NULL);
+	CHECK(strstr(wire, "null") == NULL);
+	mps_vendor_wire_json_free(wire);
+	obs_data_release(response);
+
+	response = invoke_named_request(
+		MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES,
+		"{\"source_name\":\"Playlist A\",\"offset\":2,\"limit\":2,\"playlist_revision\":7}");
+	check_request_success(response);
+	entries = obs_data_get_array(response, "entries");
+	obs_data_t *child = obs_data_array_item(entries, 0);
+	CHECK(strcmp(obs_data_get_string(child, "item_id"), "folder/one.mp4") == 0);
+	CHECK(obs_data_get_int(child, "playlist_index") == 1);
+	CHECK(obs_data_get_int(child, "folder_item_index") == 0);
+	CHECK(obs_data_get_bool(child, "selectable"));
+	obs_data_release(child);
+	obs_data_array_release(entries);
+	obs_data_release(response);
+
+	response = invoke_named_request(MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES,
+					"{\"source_name\":\"Playlist A\",\"offset\":4,\"playlist_revision\":7}");
+	check_request_success(response);
+	CHECK(obs_data_get_int(response, "count") == 1);
+	CHECK(!obs_data_get_bool(response, "has_more"));
+	CHECK(!obs_data_has_user_value(response, "next_offset"));
+	entries = obs_data_get_array(response, "entries");
+	child = obs_data_array_item(entries, 0);
+	CHECK(strcmp(obs_data_get_string(child, "item_id"), "entry-a-duplicate") == 0);
+	CHECK(strcmp(obs_data_get_string(child, "path"), "a.mp4") == 0);
+	obs_data_release(child);
+	obs_data_array_release(entries);
+	obs_data_release(response);
+
+	response = invoke_named_request(MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES,
+					"{\"source_name\":\"Playlist A\",\"offset\":5,\"playlist_revision\":7}");
+	check_request_success(response);
+	CHECK(obs_data_get_int(response, "count") == 0);
+	wire = mps_vendor_wire_request_response(MPS_VENDOR_NAME, MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES, response);
+	CHECK(strstr(wire, "\"entries\":[]") != NULL);
+	mps_vendor_wire_json_free(wire);
+	obs_data_release(response);
+}
+
+static void test_entries_invalid_requests(void)
+{
+	reset_fixtures();
+	create_source(fake_playlist_source_id, "Playlist A");
+	start_vendor();
+	const char *invalid[] = {
+		"\"offset\":true",
+		"\"offset\":-1",
+		"\"offset\":0.5",
+		"\"offset\":1",
+		"\"limit\":0",
+		"\"limit\":201",
+		"\"limit\":true",
+		"\"limit\":1.0",
+		"\"playlist_revision\":0",
+		"\"playlist_revision\":true",
+		"\"playlist_revision\":\"7\"",
+	};
+	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+		char request[256];
+		snprintf(request, sizeof(request), "{\"source_name\":\"Playlist A\",%s}", invalid[i]);
+		obs_data_t *response = invoke_named_request(MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES, request);
+		check_error_response(response, "invalid");
+		obs_data_release(response);
+	}
+	obs_data_t *response = invoke_named_request(MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES,
+						    "{\"source_name\":\"Playlist A\",\"playlist_revision\":6}");
+	check_error_response(response, "stale");
+	obs_data_release(response);
+	telemetry_unavailable = true;
+	response = invoke_named_request(MPS_VENDOR_REQUEST_GET_PLAYLIST_ENTRIES, "{\"source_name\":\"Playlist A\"}");
+	check_error_response(response, "unavailable");
+	obs_data_release(response);
+}
+
+static void test_set_playback_options_are_partial_and_typed(void)
+{
+	reset_fixtures();
+	obs_source_t *source = create_source(fake_playlist_source_id, "Playlist A");
+	obs_data_t *original = obs_data_create();
+	obs_data_set_string(original, "unrelated", "keep");
+	obs_data_set_bool(original, "loop", true);
+	obs_source_update(source, original);
+	obs_data_release(original);
+	start_vendor();
+	obs_data_t *response = invoke_named_request(MPS_VENDOR_REQUEST_SET_PLAYBACK_OPTIONS,
+						    "{\"source_name\":\"Playlist A\",\"shuffle\":true}");
+	check_request_success(response);
+	CHECK(obs_data_get_bool(response, "accepted"));
+	obs_data_release(response);
+	obs_data_t *settings = obs_source_get_settings(source);
+	CHECK(obs_data_get_bool(settings, "shuffle"));
+	CHECK(obs_data_get_bool(settings, "loop"));
+	CHECK(strcmp(obs_data_get_string(settings, "unrelated"), "keep") == 0);
+	obs_data_release(settings);
+	const char *invalid[] = {"",
+				 ",\"shuffle\":false,\"loop\":null",
+				 ",\"shuffle\":1",
+				 ",\"loop\":\"false\"",
+				 ",\"loop\":null",
+				 ",\"shuffle\":false,\"loop\":1"};
+	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+		char request[256];
+		snprintf(request, sizeof(request), "{\"source_name\":\"Playlist A\"%s}", invalid[i]);
+		response = invoke_named_request(MPS_VENDOR_REQUEST_SET_PLAYBACK_OPTIONS, request);
+		check_error_response(response, "invalid");
+		obs_data_release(response);
+	}
+	settings = obs_source_get_settings(source);
+	CHECK(obs_data_get_bool(settings, "shuffle"));
+	CHECK(obs_data_get_bool(settings, "loop"));
+	obs_data_release(settings);
+	response = invoke_named_request(MPS_VENDOR_REQUEST_SET_PLAYBACK_OPTIONS,
+					"{\"source_name\":\"Playlist A\",\"shuffle\":false,\"loop\":false}");
+	check_request_success(response);
+	obs_data_release(response);
+	settings = obs_source_get_settings(source);
+	CHECK(!obs_data_get_bool(settings, "shuffle"));
+	CHECK(!obs_data_get_bool(settings, "loop"));
+	obs_data_release(settings);
+}
+
+static void test_select_rejects_invalid_and_headless_requests(void)
+{
+	reset_fixtures();
+	create_source(fake_playlist_source_id, "Playlist A");
+	start_vendor();
+	const char *invalid[] = {"", ",\"item_id\":0", ",\"item_id\":\"\"",
+				 ",\"item_id\":\"entry-a\",\"playlist_revision\":0"};
+	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+		char request[256];
+		snprintf(request, sizeof(request), "{\"source_name\":\"Playlist A\"%s}", invalid[i]);
+		obs_data_t *response = invoke_named_request(MPS_VENDOR_REQUEST_SELECT_PLAYLIST_ITEM, request);
+		check_error_response(response, "invalid");
+		obs_data_release(response);
+	}
+	char long_request[4352];
+	char long_id[4098];
+	memset(long_id, 'x', sizeof(long_id) - 1);
+	long_id[sizeof(long_id) - 1] = '\0';
+	snprintf(long_request, sizeof(long_request), "{\"source_name\":\"Playlist A\",\"item_id\":\"%s\"}", long_id);
+	obs_data_t *invalid_response = invoke_named_request(MPS_VENDOR_REQUEST_SELECT_PLAYLIST_ITEM, long_request);
+	check_error_response(invalid_response, "invalid");
+	obs_data_release(invalid_response);
+	obs_data_t *response = invoke_named_request(MPS_VENDOR_REQUEST_SELECT_PLAYLIST_ITEM,
+						    "{\"source_name\":\"Playlist A\",\"item_id\":\"entry-a\"}");
+	check_error_response(response, "unavailable");
+	CHECK(select_calls == 0);
+	obs_data_release(response);
+}
+
+static void test_all_late_requests_are_fenced(void)
+{
+	reset_fixtures();
+	start_vendor();
+	struct fake_vendor_request callbacks[4];
+	memcpy(callbacks, websocket.requests, sizeof(callbacks));
+	mps_playlist_vendor_stop(MPS_VENDOR_STOP_FRONTEND_EXIT);
+	for (size_t i = 0; i < 4; i++) {
+		obs_data_t *request = obs_data_create();
+		obs_data_t *response = obs_data_create();
+		callbacks[i].callback(request, response, callbacks[i].priv_data);
+		check_error_response(response, "unavailable");
+		obs_data_release(request);
+		obs_data_release(response);
+	}
+}
+
 int main(void)
 {
 	CHECK(obs_startup("en-US", NULL, NULL));
@@ -1192,6 +1473,11 @@ int main(void)
 	test_playlist_change_wakes_worker_immediately();
 	test_new_and_removed_sources_are_picked_up();
 	test_stop_before_start_is_safe();
+	test_entries_pagination_and_wire();
+	test_entries_invalid_requests();
+	test_set_playback_options_are_partial_and_typed();
+	test_select_rejects_invalid_and_headless_requests();
+	test_all_late_requests_are_fenced();
 
 	reset_fixtures();
 	proc_handler_destroy(websocket.ph);

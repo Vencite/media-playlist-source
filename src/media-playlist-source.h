@@ -129,6 +129,7 @@ struct media_playlist_source {
 	 * telemetry_discontinuity is bumped by mps_playlist_change_notify under
 	 * lifecycle_mutex so a read raced by an event is rejected. */
 	pthread_mutex_t telemetry_mutex;
+	uint64_t playlist_revision;
 	uint64_t telemetry_revision;
 	struct mps_telemetry_meaning telemetry_meaning;
 	uint64_t telemetry_discontinuity;

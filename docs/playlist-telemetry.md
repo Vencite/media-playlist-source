@@ -271,3 +271,99 @@ existing cross-platform builds. Vendor wire tests use obs-websocket's real
 OBS-data-to-JSON conversion and require **test-only** `nlohmann_json` headers on
 Linux (`nlohmann-json3-dev` on Ubuntu). They add no plugin runtime dependency.
 A playback-only build can use `-DBUILD_TESTING=OFF`.
+
+## Playlist inspection and control (develop extension)
+
+The same `media-playlist-source` vendor also exposes `GetPlaylistEntries`,
+`SelectPlaylistItem` and `SetPlaybackOptions`. They use the same exact
+`source_uuid` / `source_name` resolution and structured inner success/error
+responses as `GetPlaylistState`. No VOS process or separate network server is
+required. OBS WebSocket authentication protects this interface.
+
+`schema_version` remains 1 for the existing telemetry; its unknown-value contract
+and events are unchanged. Controls reuse the plugin's existing playback logic.
+For play, pause, stop, next, previous, restart and seeking, use standard OBS
+`TriggerMediaInputAction` / `SetMediaInputCursor` requests with the MPS input UUID.
+
+### GetPlaylistEntries
+
+Example `CallVendorRequest.requestData`:
+
+```json
+{
+  "vendorName": "media-playlist-source",
+  "requestType": "GetPlaylistEntries",
+  "requestData": {"source_uuid": "mps-source-uuid", "offset": 0, "limit": 100}
+}
+```
+
+The inner response has `success`, `schema_version`, `source_uuid`, `source_name`,
+`playlist_revision`, `total_count`, `offset`, `count`, `has_more`, `entries`,
+`shuffle` and `loop`. `next_offset` exists only when `has_more` is true. Limit is
+1–200 (default100), offset is non-negative (default0); both must be integers.
+Empty results are a real empty JSON array. Only the page's strings are allocated;
+this request does not copy the entire playlist before slicing it.
+
+Each entry has `item_id`, `filename`, `path`, `playlist_index`, `is_folder`,
+`selectable`, `is_selected`, and `folder_item_index` for folder children.
+Folder headers are included but not selectable; their children appear after them.
+Duplicate paths remain separate entries. `is_selected` is the logical selection
+marker, which can precede a decoder cut; use `GetPlaylistState.current_item_id`
+for the authoritative playing decoder.
+
+Every continuation page (`offset>0`) must send the `playlist_revision` returned
+by the first page. A different revision returns `error.code="stale"`; start again
+from offset0. Revisions may change after settings updates even when the list looks
+unchanged. Reads never peek/advance shuffle or prepare another cycle.
+
+### SelectPlaylistItem
+
+```json
+{
+  "vendorName": "media-playlist-source",
+  "requestType": "SelectPlaylistItem",
+  "requestData": {
+    "source_uuid": "mps-source-uuid",
+    "item_id": "stable-entry-id-from-GetPlaylistEntries",
+    "playlist_revision": 12
+  }
+}
+```
+
+`item_id` is required, nonblank and at most4096 bytes. An optional positive
+integer `playlist_revision` prevents selection from a stale list; supplying it is
+recommended. Unknown/ambiguous IDs, folder headers and a changed revision return
+`invalid_or_stale`. A removed/resetting source or absent video subsystem is
+unavailable. Selection is checked and executed on OBS's graphics/video thread,
+with a held source reference, using the same selector as the dock.
+
+`success=true, accepted=true` means the selection request was accepted, not that
+the new decoder has already started. Observe `PlaylistStateChanged` for the actual
+committed current identity and timing. Do not retry an uncertain selection blindly.
+
+### SetPlaybackOptions
+
+```json
+{
+  "vendorName": "media-playlist-source",
+  "requestType": "SetPlaybackOptions",
+  "requestData": {"source_uuid": "mps-source-uuid", "shuffle": true, "loop": false}
+}
+```
+
+At least one of `shuffle` / `loop` is required and must be an actual JSON boolean.
+These are assignments, not toggles. The partial OBS settings update preserves
+playlist contents and other settings. `success=true, accepted=true` means OBS has
+accepted the update; VIDEO-source settings are applied on its video thread.
+The normal telemetry then reports the resulting mode. Source IDs and persisted
+setting keys are unchanged.
+
+### Client integration
+
+Any obs-websocket v5 client can send these envelopes, subscribe to Vendors (512),
+and consume `PlaylistStateChanged`. Tests exercise both existing state payloads
+and the new list responses through the actual obs-websocket JSON converter.
+Companion's standard media-source discovery may still filter out custom input
+kinds: the presence of this API is not a claim that its standard module already
+creates MPS variables or provides a ready preset. A client/module extension can
+call this API directly without routing through VOS.

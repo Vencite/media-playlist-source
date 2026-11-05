@@ -48,4 +48,8 @@ void mps_playlist_context_resolve(const struct mps_playlist_context_input *input
 
 bool mps_playlist_entries_copy(const struct darray *files, const struct media_file_data *actual_media,
 			       struct mps_playlist_item_snapshot **items, size_t *item_count);
+/* Copies at most limit entries, including folder headers, without allocating the full list. */
+bool mps_playlist_entries_copy_range(const struct darray *files, const struct media_file_data *actual_media,
+				     size_t offset, size_t limit, struct mps_playlist_item_snapshot **items,
+				     size_t *item_count, size_t *total_count);
 void mps_playlist_entries_free(struct mps_playlist_item_snapshot *items, size_t item_count);

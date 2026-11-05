@@ -7,6 +7,7 @@
 #include <QAbstractItemView>
 #include <QAction>
 #include <QComboBox>
+#include <QCheckBox>
 #include <QFont>
 #include <QFrame>
 #include <QGridLayout>
@@ -457,6 +458,14 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
 	configure_follow_context_menu(this, source_header, follow_program_action_);
+	auto *follow_checkbox = new QCheckBox(tr("Follow Program"), source_header);
+	follow_checkbox->setToolTip(tr(
+		"Follow the single visible Media Playlist Source in Program, including nested scenes. Preview is ignored."));
+	source_layout->addWidget(follow_checkbox, 2, 0, 1, 2);
+	connect(follow_checkbox, &QCheckBox::toggled, follow_program_action_, &QAction::setChecked);
+	connect(follow_program_action_, &QAction::toggled, follow_checkbox, &QCheckBox::setChecked);
+	connect(follow_program_action_, &QAction::toggled, this,
+		[this](bool enabled) { source_selector_->setEnabled(!enabled); });
 	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
 		follow_program_ = enabled;
 		follow_status_->setVisible(enabled);
@@ -797,6 +806,37 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	layout->addWidget(source_header);
 	layout->addWidget(make_separator(this));
 
+	playback_controls_ = new QWidget(this);
+	auto *controls = new QHBoxLayout(playback_controls_);
+	controls->setContentsMargins(0, 0, 0, 0);
+	controls->setSpacing(6);
+	const auto add_control = [this, controls](const QString &text, QStyle::StandardPixmap icon,
+						  PlaybackAction action) {
+		auto *button = new QPushButton(text, playback_controls_);
+		button->setIcon(palette_icon(this, icon, QPalette::ButtonText));
+		button->setToolTip(text);
+		button->setAccessibleName(text);
+		controls->addWidget(button);
+		connect(button, &QPushButton::clicked, this, [this, action] { control_playback(action); });
+		return button;
+	};
+	add_control(tr("Previous"), QStyle::SP_MediaSkipBackward, PlaybackAction::Previous);
+	pause_button_ = add_control(tr("Play"), QStyle::SP_MediaPlay, PlaybackAction::PlayPause);
+	add_control(tr("Stop"), QStyle::SP_MediaStop, PlaybackAction::Stop);
+	add_control(tr("Next"), QStyle::SP_MediaSkipForward, PlaybackAction::Next);
+	layout->addWidget(playback_controls_);
+	auto *options = new QHBoxLayout;
+	shuffle_toggle_ = new QCheckBox(tr("Shuffle"), this);
+	loop_toggle_ = new QCheckBox(tr("Loop"), this);
+	options->addWidget(shuffle_toggle_);
+	options->addWidget(loop_toggle_);
+	options->addStretch();
+	layout->addLayout(options);
+	connect(shuffle_toggle_, &QCheckBox::toggled, this,
+		[this](bool enabled) { set_playback_option("shuffle", enabled); });
+	connect(loop_toggle_, &QCheckBox::toggled, this,
+		[this](bool enabled) { set_playback_option("loop", enabled); });
+
 	auto *playlist_header = new QGridLayout;
 	playlist_header->setContentsMargins(0, 0, 0, 0);
 	playlist_header->setColumnStretch(0, 1);
@@ -832,7 +872,7 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	layout->addWidget(make_section_label(tr("Selected"), this, false));
 	selected_value_ = new ElidedFileLabel(this);
 	layout->addWidget(selected_value_);
-	play_button_ = new QPushButton(tr("Play Selected"), this);
+	play_button_ = new QPushButton(tr("Play selected file"), this);
 	play_button_->setIcon(palette_icon(this, QStyle::SP_MediaPlay, QPalette::ButtonText));
 	play_button_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 	play_button_->setMinimumHeight(play_button_->sizeHint().height() + 6);
@@ -842,6 +882,14 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
 	configure_follow_context_menu(this, source_header, follow_program_action_);
+	auto *follow_checkbox = new QCheckBox(tr("Follow Program"), source_header);
+	follow_checkbox->setToolTip(tr(
+		"Follow the single visible Media Playlist Source in Program, including nested scenes. Preview is ignored."));
+	source_layout->addWidget(follow_checkbox, 2, 0, 1, 2);
+	connect(follow_checkbox, &QCheckBox::toggled, follow_program_action_, &QAction::setChecked);
+	connect(follow_program_action_, &QAction::toggled, follow_checkbox, &QCheckBox::setChecked);
+	connect(follow_program_action_, &QAction::toggled, this,
+		[this](bool enabled) { source_selector_->setEnabled(!enabled); });
 	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
 		follow_program_ = enabled;
 		follow_status_->setVisible(enabled);
@@ -870,7 +918,9 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 					       &selected_stable_id_);
 		update_play_button();
 	});
+	play_button_->setToolTip(tr("Play the selected file. Double-click a file or press Enter to start it."));
 	connect(play_button_, &QPushButton::clicked, this, &PlaylistControlDock::play_selected);
+	connect(playlist_, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem *, int) { play_selected(); });
 
 	connect_obs_events(source_event, this);
 	obs_frontend_add_event_callback(frontend_event, this);
@@ -1050,6 +1100,12 @@ void PlaylistControlDock::refresh_playlist()
 
 	struct mps_playlist_entries_snapshot snapshot = {0};
 	const bool found = mps_playlist_entries_snapshot_get(source, &snapshot);
+	const bool playing = obs_source_media_get_state(source) == OBS_MEDIA_STATE_PLAYING;
+	pause_button_->setText(playing ? tr("Pause") : tr("Play"));
+	pause_button_->setIcon(
+		palette_icon(this, playing ? QStyle::SP_MediaPause : QStyle::SP_MediaPlay, QPalette::ButtonText));
+	pause_button_->setAccessibleName(pause_button_->text());
+	pause_button_->setToolTip(pause_button_->text());
 	obs_source_release(source);
 	if (!found) {
 		mps_playlist_entries_snapshot_free(&snapshot);
@@ -1057,7 +1113,17 @@ void PlaylistControlDock::refresh_playlist()
 		return;
 	}
 
-	shuffle_info_->setVisible(snapshot.shuffle);
+	playlist_revision_ = snapshot.playlist_revision;
+	{
+		const QSignalBlocker shuffle_blocker(shuffle_toggle_);
+		const QSignalBlocker loop_blocker(loop_toggle_);
+		shuffle_toggle_->setChecked(snapshot.shuffle);
+		loop_toggle_->setChecked(snapshot.loop);
+	}
+	shuffle_info_->setText(tr("%1 entries%2")
+				       .arg(snapshot.total_count)
+				       .arg(snapshot.shuffle ? tr(" · shuffled playback") : QString()));
+	shuffle_info_->setVisible(true);
 	QTreeWidgetItem *folder_parent = nullptr;
 	QTreeWidgetItem *restored_item = nullptr;
 	for (std::size_t i = 0; i < snapshot.item_count; i++) {
@@ -1120,7 +1186,11 @@ void PlaylistControlDock::refresh_playlist()
 
 void PlaylistControlDock::update_play_button()
 {
-	play_button_->setEnabled(selection_valid_ && !selected_source_uuid_.isEmpty());
+	const bool has_source = !selected_source_uuid_.isEmpty();
+	playback_controls_->setEnabled(has_source);
+	shuffle_toggle_->setEnabled(has_source);
+	loop_toggle_->setEnabled(has_source);
+	play_button_->setEnabled(selection_valid_ && has_source);
 	QTreeWidgetItem *item = selection_valid_ ? playlist_->currentItem() : nullptr;
 	const QByteArray selected_path = item ? item->data(0, kPathRole).toString().toUtf8() : QByteArray();
 	selected_value_->setFilePath(selected_path.isEmpty() ? nullptr : selected_path.constData());
@@ -1128,28 +1198,79 @@ void PlaylistControlDock::update_play_button()
 
 void PlaylistControlDock::play_selected()
 {
-	if (!selection_valid_ || selected_source_uuid_.isEmpty())
+	if (!selection_valid_ || selected_source_uuid_.isEmpty() || selected_stable_id_.isEmpty())
 		return;
+	const QByteArray uuid = selected_source_uuid_.toUtf8();
+	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
+	struct obs_video_info video_info;
+	if (!source)
+		return;
+	if (!obs_get_video_info(&video_info)) {
+		obs_source_release(source);
+		return;
+	}
+	struct Selection {
+		obs_source_t *source;
+		QByteArray id;
+		std::uint64_t revision;
+	};
+	auto *selection = new Selection{source, selected_stable_id_.toUtf8(), playlist_revision_};
+	obs_queue_task(
+		OBS_TASK_GRAPHICS,
+		[](void *data) {
+			auto *selection = static_cast<Selection *>(data);
+			mps_playlist_select_item(selection->source, selection->id.constData(), selection->revision);
+			obs_source_release(selection->source);
+			delete selection;
+		},
+		selection, false);
+}
 
+void PlaylistControlDock::control_playback(PlaybackAction action)
+{
 	const QByteArray uuid = selected_source_uuid_.toUtf8();
 	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
 	if (!source)
 		return;
-
-	bool called = false;
 	const char *id = obs_source_get_unversioned_id(source);
-	proc_handler_t *handler = id && std::strcmp(id, kSourceId) == 0 ? obs_source_get_proc_handler(source) : nullptr;
-	if (handler) {
-		calldata_t calldata;
-		calldata_init(&calldata);
-		calldata_set_int(&calldata, "media_index", static_cast<long long>(selected_media_index_));
-		calldata_set_int(&calldata, "folder_item_index", static_cast<long long>(selected_folder_item_index_));
-		called = proc_handler_call(handler, "select_index", &calldata);
-		calldata_free(&calldata);
+	if (id && std::strcmp(id, kSourceId) == 0) {
+		switch (action) {
+		case PlaybackAction::Previous:
+			obs_source_media_previous(source);
+			break;
+		case PlaybackAction::Next:
+			obs_source_media_next(source);
+			break;
+		case PlaybackAction::Stop:
+			obs_source_media_stop(source);
+			break;
+		case PlaybackAction::PlayPause: {
+			auto state = obs_source_media_get_state(source);
+			if (state == OBS_MEDIA_STATE_STOPPED || state == OBS_MEDIA_STATE_ENDED)
+				obs_source_media_restart(source);
+			else
+				obs_source_media_play_pause(source, state == OBS_MEDIA_STATE_PLAYING);
+			break;
+		}
+		}
 	}
 	obs_source_release(source);
-	if (called)
-		schedule_playback_refresh(uuid.constData());
+}
+
+void PlaylistControlDock::set_playback_option(const char *key, bool enabled)
+{
+	const QByteArray uuid = selected_source_uuid_.toUtf8();
+	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
+	if (!source)
+		return;
+	const char *id = obs_source_get_unversioned_id(source);
+	if (id && std::strcmp(id, kSourceId) == 0) {
+		obs_data_t *settings = obs_data_create();
+		obs_data_set_bool(settings, key, enabled);
+		obs_source_update(source, settings);
+		obs_data_release(settings);
+	}
+	obs_source_release(source);
 }
 
 extern "C" void mps_playlist_dock_register(void)
