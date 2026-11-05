@@ -458,14 +458,6 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
 	configure_follow_context_menu(this, source_header, follow_program_action_);
-	auto *follow_checkbox = new QCheckBox(tr("Follow Program"), source_header);
-	follow_checkbox->setToolTip(tr(
-		"Follow the single visible Media Playlist Source in Program, including nested scenes. Preview is ignored."));
-	source_layout->addWidget(follow_checkbox, 2, 0, 1, 2);
-	connect(follow_checkbox, &QCheckBox::toggled, follow_program_action_, &QAction::setChecked);
-	connect(follow_program_action_, &QAction::toggled, follow_checkbox, &QCheckBox::setChecked);
-	connect(follow_program_action_, &QAction::toggled, this,
-		[this](bool enabled) { source_selector_->setEnabled(!enabled); });
 	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
 		follow_program_ = enabled;
 		follow_status_->setVisible(enabled);
@@ -882,14 +874,17 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
 	configure_follow_context_menu(this, source_header, follow_program_action_);
-	auto *follow_checkbox = new QCheckBox(tr("Follow Program"), source_header);
-	follow_checkbox->setToolTip(tr(
-		"Follow the single visible Media Playlist Source in Program, including nested scenes. Preview is ignored."));
-	source_layout->addWidget(follow_checkbox, 2, 0, 1, 2);
-	connect(follow_checkbox, &QCheckBox::toggled, follow_program_action_, &QAction::setChecked);
-	connect(follow_program_action_, &QAction::toggled, follow_checkbox, &QCheckBox::setChecked);
-	connect(follow_program_action_, &QAction::toggled, this,
-		[this](bool enabled) { source_selector_->setEnabled(!enabled); });
+	auto *show_controls = new QAction(tr("Show playback toolbar"), this);
+	show_controls->setObjectName(QStringLiteral("mpsShowPlaybackControls"));
+	show_controls->setCheckable(true);
+	show_controls->setChecked(true);
+	playback_controls_->setObjectName(QStringLiteral("mpsPlaybackControls"));
+	connect(show_controls, &QAction::toggled, playback_controls_, &QWidget::setVisible);
+	addAction(show_controls);
+	source_header->addAction(show_controls);
+	playlist_->setContextMenuPolicy(Qt::ActionsContextMenu);
+	playlist_->addAction(follow_program_action_);
+	playlist_->addAction(show_controls);
 	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
 		follow_program_ = enabled;
 		follow_status_->setVisible(enabled);
