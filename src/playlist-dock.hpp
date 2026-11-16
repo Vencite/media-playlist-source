@@ -15,7 +15,6 @@
 class QAction;
 class ElidedFileLabel;
 class QComboBox;
-class QCheckBox;
 class QLabel;
 class QProgressBar;
 class QPushButton;
@@ -64,6 +63,9 @@ private:
 	QLabel *elapsed_value_ = nullptr;
 	QLabel *remaining_value_ = nullptr;
 	QLabel *playlist_remaining_value_ = nullptr;
+	QWidget *playlist_remaining_row_ = nullptr;
+	QAction *shuffle_action_ = nullptr;
+	QAction *loop_action_ = nullptr;
 	QTimer *progress_timer_ = nullptr;
 	QAction *follow_program_action_ = nullptr;
 	QString selected_source_uuid_;
@@ -99,7 +101,6 @@ private:
 	void play_selected();
 	enum class PlaybackAction { Previous, PlayPause, Stop, Next };
 	void control_playback(PlaybackAction action);
-	void set_playback_option(const char *key, bool enabled);
 	void schedule_playback_refresh(const char *source_uuid);
 	void schedule_program_refresh();
 	bool refresh_program_state();
@@ -107,8 +108,8 @@ private:
 	QComboBox *source_selector_ = nullptr;
 	QLabel *follow_status_ = nullptr;
 	QLabel *shuffle_info_ = nullptr;
-	QCheckBox *shuffle_toggle_ = nullptr;
-	QCheckBox *loop_toggle_ = nullptr;
+	QAction *shuffle_action_ = nullptr;
+	QAction *loop_action_ = nullptr;
 	QWidget *playback_controls_ = nullptr;
 	QPushButton *pause_button_ = nullptr;
 	std::uint64_t playlist_revision_ = 0;

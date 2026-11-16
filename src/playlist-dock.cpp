@@ -7,7 +7,6 @@
 #include <QAbstractItemView>
 #include <QAction>
 #include <QComboBox>
-#include <QCheckBox>
 #include <QFont>
 #include <QFrame>
 #include <QGridLayout>
@@ -279,6 +278,50 @@ void configure_follow_context_menu(QWidget *dock, QWidget *source_header, QActio
 	source_header->addAction(action);
 }
 
+void set_playback_option(const QString &source_uuid, const char *key, bool enabled)
+{
+	const QByteArray uuid = source_uuid.toUtf8();
+	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
+	if (!source)
+		return;
+	const char *id = obs_source_get_unversioned_id(source);
+	if (id && std::strcmp(id, kSourceId) == 0) {
+		obs_data_t *settings = obs_data_create();
+		obs_data_set_bool(settings, key, enabled);
+		obs_source_update(source, settings);
+		obs_data_release(settings);
+	}
+	obs_source_release(source);
+}
+
+void add_playback_context_actions(QWidget *dock, QWidget *header, QComboBox *selector, QAction **shuffle,
+				  QAction **loop)
+{
+	const auto add = [dock, header, selector](const QString &text, const char *key, const char *name) {
+		auto *action = new QAction(text, dock);
+		action->setObjectName(QString::fromUtf8(name));
+		action->setCheckable(true);
+		action->setEnabled(false);
+		dock->addAction(action);
+		header->addAction(action);
+		QObject::connect(action, &QAction::triggered, dock, [selector, key](bool enabled) {
+			set_playback_option(selector->currentData().toString(), key, enabled);
+		});
+		return action;
+	};
+	*shuffle = add(QObject::tr("Shuffle"), "shuffle", "mpsShuffle");
+	*loop = add(QObject::tr("Loop"), "loop", "mpsLoop");
+}
+
+void update_playback_context_actions(QAction *shuffle, QAction *loop, bool available, bool shuffled, bool looping)
+{
+	const QSignalBlocker shuffle_blocker(shuffle), loop_blocker(loop);
+	shuffle->setEnabled(available);
+	loop->setEnabled(available);
+	shuffle->setChecked(available && shuffled);
+	loop->setChecked(available && looping);
+}
+
 QLabel *make_section_label(const QString &text, QWidget *parent = nullptr, bool bold = true)
 {
 	auto *label = new QLabel(text, parent);
@@ -448,16 +491,20 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	context_layout->addWidget(next_value_, 10, 1, 1, 2);
 	layout->addLayout(context_layout);
 	layout->addStretch();
-	auto *remaining_layout = new QHBoxLayout;
+	playlist_remaining_row_ = new QWidget(this);
+	playlist_remaining_row_->setObjectName(QStringLiteral("mpsPlaylistRemainingRow"));
+	auto *remaining_layout = new QHBoxLayout(playlist_remaining_row_);
+	remaining_layout->setContentsMargins(0, 0, 0, 0);
 	remaining_layout->addWidget(make_section_label(tr("Playlist remaining"), this));
 	remaining_layout->addStretch();
 	playlist_remaining_value_ = make_secondary_label(QStringLiteral("--:--"), this);
 	remaining_layout->addWidget(playlist_remaining_value_);
-	layout->addLayout(remaining_layout);
+	layout->addWidget(playlist_remaining_row_);
 
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
 	configure_follow_context_menu(this, source_header, follow_program_action_);
+	add_playback_context_actions(this, source_header, source_selector_, &shuffle_action_, &loop_action_);
 	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
 		follow_program_ = enabled;
 		follow_status_->setVisible(enabled);
@@ -633,6 +680,8 @@ void PlaylistQueueDock::refresh_sources()
 
 void PlaylistQueueDock::clear_snapshot()
 {
+	update_playback_context_actions(shuffle_action_, loop_action_, false, false, false);
+	playlist_remaining_row_->setVisible(true);
 	previous_value_->setFilePath(nullptr);
 	current_value_->setFilePath(nullptr);
 	next_value_->setFilePath(nullptr);
@@ -681,6 +730,9 @@ void PlaylistQueueDock::refresh_snapshot()
 	const bool standby_duration_found =
 		found && snapshot.next &&
 		mps_playlist_standby_duration_get(source, snapshot.next, &standby_duration_ms);
+	obs_data_t *settings = obs_source_get_settings(source);
+	const bool looping = timing_found ? telemetry.loop : obs_data_get_bool(settings, "loop");
+	obs_data_release(settings);
 	obs_source_release(source);
 	if (!found) {
 		mps_playlist_context_snapshot_free(&snapshot);
@@ -689,6 +741,8 @@ void PlaylistQueueDock::refresh_snapshot()
 		return;
 	}
 
+	update_playback_context_actions(shuffle_action_, loop_action_, true, snapshot.shuffle, looping);
+	playlist_remaining_row_->setVisible(!looping);
 	previous_value_->setFilePath(snapshot.previous);
 	current_value_->setFilePath(timing_found ? telemetry.current_path : nullptr);
 	next_value_->setFilePath(snapshot.next);
@@ -727,6 +781,8 @@ void PlaylistQueueDock::refresh_progress()
 	const bool found = mps_playlist_telemetry_get(source, &telemetry);
 	obs_source_release(source);
 	if (found) {
+		update_playback_context_actions(shuffle_action_, loop_action_, true, telemetry.shuffle, telemetry.loop);
+		playlist_remaining_row_->setVisible(!telemetry.loop);
 		current_value_->setFilePath(telemetry.current_path);
 		current_path_ = QString::fromUtf8(telemetry.current_path ? telemetry.current_path : "");
 		has_current_ = telemetry.current_path != nullptr;
@@ -817,18 +873,6 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	add_control(tr("Stop"), QStyle::SP_MediaStop, PlaybackAction::Stop);
 	add_control(tr("Next"), QStyle::SP_MediaSkipForward, PlaybackAction::Next);
 	layout->addWidget(playback_controls_);
-	auto *options = new QHBoxLayout;
-	shuffle_toggle_ = new QCheckBox(tr("Shuffle"), this);
-	loop_toggle_ = new QCheckBox(tr("Loop"), this);
-	options->addWidget(shuffle_toggle_);
-	options->addWidget(loop_toggle_);
-	options->addStretch();
-	layout->addLayout(options);
-	connect(shuffle_toggle_, &QCheckBox::toggled, this,
-		[this](bool enabled) { set_playback_option("shuffle", enabled); });
-	connect(loop_toggle_, &QCheckBox::toggled, this,
-		[this](bool enabled) { set_playback_option("loop", enabled); });
-
 	auto *playlist_header = new QGridLayout;
 	playlist_header->setContentsMargins(0, 0, 0, 0);
 	playlist_header->setColumnStretch(0, 1);
@@ -874,6 +918,7 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
 	configure_follow_context_menu(this, source_header, follow_program_action_);
+	add_playback_context_actions(this, source_header, source_selector_, &shuffle_action_, &loop_action_);
 	auto *show_controls = new QAction(tr("Show playback toolbar"), this);
 	show_controls->setObjectName(QStringLiteral("mpsShowPlaybackControls"));
 	show_controls->setCheckable(true);
@@ -885,6 +930,8 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	playlist_->setContextMenuPolicy(Qt::ActionsContextMenu);
 	playlist_->addAction(follow_program_action_);
 	playlist_->addAction(show_controls);
+	playlist_->addAction(shuffle_action_);
+	playlist_->addAction(loop_action_);
 	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
 		follow_program_ = enabled;
 		follow_status_->setVisible(enabled);
@@ -1081,6 +1128,7 @@ void PlaylistControlDock::refresh_playlist()
 	selection_valid_ = false;
 	selected_stable_id_.clear();
 	shuffle_info_->setVisible(false);
+	update_playback_context_actions(shuffle_action_, loop_action_, false, false, false);
 	if (selected_source_uuid_.isEmpty()) {
 		update_play_button();
 		return;
@@ -1109,12 +1157,7 @@ void PlaylistControlDock::refresh_playlist()
 	}
 
 	playlist_revision_ = snapshot.playlist_revision;
-	{
-		const QSignalBlocker shuffle_blocker(shuffle_toggle_);
-		const QSignalBlocker loop_blocker(loop_toggle_);
-		shuffle_toggle_->setChecked(snapshot.shuffle);
-		loop_toggle_->setChecked(snapshot.loop);
-	}
+	update_playback_context_actions(shuffle_action_, loop_action_, true, snapshot.shuffle, snapshot.loop);
 	shuffle_info_->setText(tr("%1 entries%2")
 				       .arg(snapshot.total_count)
 				       .arg(snapshot.shuffle ? tr(" · shuffled playback") : QString()));
@@ -1183,8 +1226,7 @@ void PlaylistControlDock::update_play_button()
 {
 	const bool has_source = !selected_source_uuid_.isEmpty();
 	playback_controls_->setEnabled(has_source);
-	shuffle_toggle_->setEnabled(has_source);
-	loop_toggle_->setEnabled(has_source);
+
 	play_button_->setEnabled(selection_valid_ && has_source);
 	QTreeWidgetItem *item = selection_valid_ ? playlist_->currentItem() : nullptr;
 	const QByteArray selected_path = item ? item->data(0, kPathRole).toString().toUtf8() : QByteArray();
@@ -1248,22 +1290,6 @@ void PlaylistControlDock::control_playback(PlaybackAction action)
 			break;
 		}
 		}
-	}
-	obs_source_release(source);
-}
-
-void PlaylistControlDock::set_playback_option(const char *key, bool enabled)
-{
-	const QByteArray uuid = selected_source_uuid_.toUtf8();
-	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
-	if (!source)
-		return;
-	const char *id = obs_source_get_unversioned_id(source);
-	if (id && std::strcmp(id, kSourceId) == 0) {
-		obs_data_t *settings = obs_data_create();
-		obs_data_set_bool(settings, key, enabled);
-		obs_source_update(source, settings);
-		obs_data_release(settings);
 	}
 	obs_source_release(source);
 }
