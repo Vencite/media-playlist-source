@@ -211,3 +211,11 @@ Use a local-video playlist `A -> B` and verify each behavior independently:
 3. **Pause/Unpause**, visible: let `A` end. `B` must play.
 4. **Pause/Unpause**, hidden: hide during `A`, change the selected/current target to `B`, and wait. `B` must remain stopped while hidden; after showing the parent, it must start rather than remain on its preloaded frame.
 5. **Stop/Restart** and **Stop/Play Next**: hide and show around a pending local-video transition. Each must retain its existing stop/restart or stop/select-next behavior.
+
+## Folder monitoring
+
+1. Leave monitoring off: existing folder order and playback must stay unchanged.
+2. Enable it; add, rename, delete and overwrite files. Check all sort modes, equal dates, and copying in stages with stability enabled.
+3. Change other files while playing: active playback and unaffected preload must continue. Remove current/next files and verify deterministic recovery without stale preload.
+4. Check Shuffle/Loop, Previous/Next, pause/stop/visibility, multiple folders and independent sources; docks/API must update only on effective changes.
+5. Disconnect/reconnect a folder: retain its last contents while unavailable. Toggle monitoring and delete sources during scans; check clean OBS shutdown.

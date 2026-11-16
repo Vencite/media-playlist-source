@@ -29,6 +29,7 @@ The original plugin was created by Ian Rodriguez / CodeYan01.
 - **NEW in 0.1.5:** **Playlist Control** dock for browsing the configured playlist and safely starting any selected file or folder item.
 - **NEW in 0.1.5:** Optional **Follow Program MPS** mode for both docks, available from their right-click menus.
 - Plays playlists of local files, folders, and URLs supported by FFmpeg.
+- Optional folder monitoring refreshes added, removed and changed files in the background, with filename/date sorting and a configurable check interval. Disabled by default.
 - Allows editing the playlist without restarting playback, including reordering items.
 - Allows editing source settings without restarting the current video.
 - Saves the currently playing file so it can be resumed when OBS restarts.
@@ -61,7 +62,7 @@ The current build configuration targets OBS Studio 31.1.1 and the fork is tested
 - The Properties window shows the current filename, but it cannot be updated automatically when playback advances because doing so can cause OBS to crash while the Properties window is being interacted with. Reopening Properties refreshes the displayed filename.
 - Programmatic playlist updates must preserve or provide each entry's `uuid`. OBS generates and preserves those IDs for editable-list changes made in the Properties UI; the plugin uses them to keep duplicate entries and the current item distinct. See [OBS PR #11126](https://github.com/obsproject/obs-studio/pull/11126).
 - Audio track and subtitle selection are not supported yet.
-- Folder contents are not refreshed automatically yet. Saving the source settings again refreshes them manually.
+- Folder monitoring uses stable size and modification time to delay files still being written; it cannot guarantee another application has finished writing.
 
 ## For developers
 

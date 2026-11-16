@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 #include "duration-inventory.h"
+#include "folder-monitor.h"
 #include "playlist-vendor.h"
 
 #ifdef MPS_ENABLE_FRONTEND_API
@@ -31,6 +32,7 @@ static void telemetry_frontend_event(enum obs_frontend_event event, void *data)
 	UNUSED_PARAMETER(data);
 	if (event == OBS_FRONTEND_EVENT_EXIT) {
 		mps_playlist_vendor_stop(MPS_VENDOR_STOP_FRONTEND_EXIT);
+		mps_folder_monitor_shutdown();
 		mps_duration_inventory_stop();
 	}
 }
@@ -80,6 +82,7 @@ void obs_module_post_load(void)
 void obs_module_unload(void)
 {
 	mps_playlist_vendor_stop(MPS_VENDOR_STOP_UNLOAD);
+	mps_folder_monitor_shutdown();
 	mps_duration_inventory_stop();
 #ifdef MPS_ENABLE_FRONTEND_API
 	obs_frontend_remove_event_callback(telemetry_frontend_event, NULL);

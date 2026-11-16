@@ -26,6 +26,8 @@ struct media_file_data {
 	char *id;
 	bool is_url;
 	bool is_folder;
+	bool monitor_stamp;
+	int64_t monitor_size, monitor_mtime, monitor_mtime_nsec;
 	DARRAY(struct media_file_data) folder_items;
 	struct media_file_data *parent;
 	const char *parent_id; // for folder items

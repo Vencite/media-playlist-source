@@ -41,6 +41,10 @@ endif()
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
+    src/folder-monitor.c
+    src/folder-monitor.h
+    src/folder-reconcile.c
+    src/folder-reconcile.h
     src/plugin-main.c
     src/playlist.h
     src/playlist-context.h
@@ -70,6 +74,11 @@ endif()
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
 if(BUILD_TESTING)
+  add_executable(folder-reconcile-test tests/folder-reconcile-test.c src/folder-reconcile.c)
+  target_include_directories(folder-reconcile-test PRIVATE src)
+  target_link_libraries(folder-reconcile-test PRIVATE OBS::libobs)
+  add_test(NAME folder-reconcile COMMAND folder-reconcile-test)
+
   add_executable(playback-coordinator-test tests/playback-coordinator-test.c src/playback-coordinator.c)
   target_include_directories(playback-coordinator-test PRIVATE src)
   add_test(NAME playback-coordinator COMMAND playback-coordinator-test)
@@ -88,6 +97,8 @@ if(BUILD_TESTING)
   add_executable(
     shuffle-activation-test
     tests/shuffle-activation-test.c
+    src/folder-monitor.c
+    src/folder-reconcile.c
     src/shuffler.c
     src/playlist-context.c
     src/playback-coordinator.c
@@ -117,6 +128,8 @@ if(BUILD_TESTING)
   add_executable(
     playlist-telemetry-runtime-test
     tests/playlist-telemetry-runtime-test.c
+    src/folder-monitor.c
+    src/folder-reconcile.c
     src/playlist-telemetry.c
     src/playlist-context.c
     src/shuffler.c
@@ -127,6 +140,11 @@ if(BUILD_TESTING)
   add_test(NAME playlist-telemetry-runtime COMMAND playlist-telemetry-runtime-test)
 
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(folder-monitor-test tests/folder-monitor-test.c)
+    target_include_directories(folder-monitor-test PRIVATE src)
+    target_link_libraries(folder-monitor-test PRIVATE OBS::libobs)
+    add_test(NAME folder-monitor COMMAND folder-monitor-test)
+    set_tests_properties(folder-monitor PROPERTIES TIMEOUT 30)
     find_package(nlohmann_json 3.11 REQUIRED)
     add_executable(
       playlist-vendor-test

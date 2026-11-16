@@ -53,6 +53,8 @@ enum shuffle_reset_behavior {
 struct media_playlist_source;
 struct media_source_callback_context;
 struct mps_duration_inventory;
+struct mps_folder_monitor;
+struct mps_folder_result;
 
 /* Scalar meaning of one telemetry observation. snapshot_revision advances only
  * when this meaning changes, so continuous elapsed/remaining drift and query
@@ -123,6 +125,14 @@ struct media_playlist_source {
 	size_t consecutive_failures;
 	pthread_mutex_t lifecycle_mutex;
 
+	struct mps_folder_monitor *folder_monitor;
+	struct mps_folder_result *folder_previous;
+	struct media_file_data *folder_orphan;
+	char *folder_settings_baseline;
+	uint64_t folder_generation;
+	int folder_sort;
+	unsigned folder_interval;
+	bool folder_watch, folder_wait;
 	struct shuffler shuffler;
 	struct mps_duration_inventory *duration_inventory;
 	/* Observers are serialized by telemetry_mutex, which playback never takes.
