@@ -23,34 +23,15 @@ The fork started as a production-focused fix for visible gaps between playlist i
 
 The original plugin was created by Ian Rodriguez / CodeYan01.
 
-## Latest additions (develop)
-
-- **Playlist timing:** remaining time for the current file and playlist pass, adjusted for playback speed. The Queue dock hides the playlist countdown while Loop is on.
-- **Playback controls:** Previous, Play/Pause, Stop and Next in Playlist Control, with an optional toolbar. Shuffle and Loop are available from both docks' right-click menus.
-- **Fresh shuffle:** preserve the existing cycle or start a fresh cycle when the source becomes active.
-- **Folder monitoring:** optional background refresh for added, removed and changed files, with filename/date sorting, a configurable interval and a file-stability check. Disabled by default.
-- **WebSocket integration:** read playlist state and entries, select items, and change Shuffle/Loop from external clients.
-
 ## Features
 
-- **Playlist Queue** dock showing Previous, Now Playing and Up Next, including duration, playback progress and Program-scene status.
-- **Playlist Control** dock for browsing the configured playlist and safely starting any selected file or folder item.
-- Optional **Follow Program MPS** mode for both docks, available from their right-click menus.
-- Plays playlists of local files, folders, and URLs supported by FFmpeg.
-- Allows editing the playlist without restarting playback, including reordering items.
-- Allows editing source settings without restarting the current video.
-- Saves the currently playing file so it can be resumed when OBS restarts.
-- Allows selecting a file or folder item directly from the playlist.
-- Uses VLC 4-style shuffle behavior:
-  - Items can be added or removed without reshuffling the already established history.
-  - Previously played items remain available through Previous Item.
-  - Selecting a file or folder item does not break shuffle history.
-  - The playlist reshuffles after the last file is played without discarding history.
-- Shows the filename of the current file in the Properties window.
-- Can start with either the first file or the previously current file when the source is restarted.
-- Preloads the next local video and switches between internal A/B decoders to avoid the blank or transparent frame that can otherwise appear between consecutive files.
-- Routes decoder audio through the parent Media Playlist Source so its mixer gain, mute state, filters, and OBS track routing remain authoritative.
-- Both docks are available through OBS's **Docks** menu.
+- Play local files, folders and FFmpeg-supported URLs, with seamless A/B video transitions and OBS mixer audio control.
+- **Playlist Queue:** Previous, Now Playing and Up Next, progress and remaining time. The playlist countdown is hidden while Loop is on.
+- **Playlist Control:** browse and start individual entries, with an optional playback toolbar.
+- **Right-click options:** Follow Program MPS, Shuffle and Loop in both docks.
+- Shuffle with playback history and optional fresh shuffle on activation.
+- Optional folder monitoring with filename/date sorting and file-stability checks.
+- Edit playlists during playback, remember the current entry across OBS restarts, and integrate through obs-websocket.
 
 ## Installation
 
@@ -66,10 +47,9 @@ The current build configuration targets OBS Studio 31.1.1 and the fork is tested
 
 ## Limitations
 
-- The Properties window shows the current filename, but it cannot be updated automatically when playback advances because doing so can cause OBS to crash while the Properties window is being interacted with. Reopening Properties refreshes the displayed filename.
-- Programmatic playlist updates must preserve or provide each entry's `uuid`. OBS generates and preserves those IDs for editable-list changes made in the Properties UI; the plugin uses them to keep duplicate entries and the current item distinct. See [OBS PR #11126](https://github.com/obsproject/obs-studio/pull/11126).
-- Audio track and subtitle selection are not supported yet.
-- Folder monitoring uses stable size and modification time to delay files still being written; it cannot guarantee another application has finished writing.
+- The current filename in Properties does not refresh continuously; reopen the window to update it.
+- Choosing between embedded audio or subtitle tracks (e.g. different languages) is not supported.
+- File-stability checks help avoid unfinished copies, but cannot guarantee completion.
 
 ## WebSocket integration
 
@@ -84,29 +64,10 @@ Other obs-websocket v5 clients use `CallVendorRequest`. See the [API reference](
 
 ## For developers
 
-To inspect the keys stored in the source [settings](https://docs.obsproject.com/reference-sources#c.obs_source_get_settings), use [obs_data_get_json](https://docs.obsproject.com/reference-settings#c.obs_data_get_json) or inspect the scene collection JSON. The implementation is in [`src/media-playlist-source.c`](src/media-playlist-source.c).
-
-To select a file programmatically:
-
-```c
-proc_handler_t *ph = obs_source_get_proc_handler(source);
-struct calldata cd = {0};
-calldata_set_int(&cd, "media_index", 3); // 4th file
-calldata_set_int(&cd, "folder_item_index", 3); // 4th folder item of the 4th file
-proc_handler_call(ph, "select_index", &cd);
-calldata_free(&cd);
-```
-
-`media_index` is the zero-based index of the file in the playlist.
-
-`folder_item_index` is the zero-based index of the folder item inside the folder at `media_index`.
-
-If the item at `media_index` is not a folder, `folder_item_index` is ignored. Out-of-range indexes are reset to `0`.
+See [integration notes](docs/developer-integration.md) for source settings, playlist IDs and the legacy native selection procedure, or the [WebSocket API](docs/playlist-telemetry.md) for external clients.
 
 ## Development and testing
 
 Development of this fork uses AI-assisted coding tools where useful, but changes are reviewed, compiled in CI, and validated in OBS before being relied on in production.
-
-Linux CI runs CTest; Windows CI also runs native folder tests. Vendor wire-contract tests use obs-websocket's JSON converter and require the **test-only** `nlohmann-json3-dev` package on Ubuntu. Use `-DBUILD_TESTING=OFF` to omit tests. The opt-in duration-probing benchmark target is `duration-probe-benchmark`.
 
 Release validation notes are kept in [docs/release-notes](docs/release-notes), and the manual regression checklist is available in [tests/manual-regression.md](tests/manual-regression.md).

@@ -9,6 +9,7 @@
 !/docs
 /docs/*
 !/docs/playlist-telemetry.md
+!/docs/developer-integration.md
 !/src
 !/tests
 !.clang-format
