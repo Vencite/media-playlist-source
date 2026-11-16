@@ -1,6 +1,6 @@
 # Media Playlist Source
 
-[![Latest fork release](https://img.shields.io/github/v/release/Vencite/media-playlist-source?filter=v%2A-ven&display_name=tag&sort=date&cacheSeconds=300&label=latest%20fork%20release)](https://github.com/Vencite/media-playlist-source/releases)
+[![Latest fork release](https://img.shields.io/github/v/release/Vencite/media-playlist-source?display_name=tag&sort=date&cacheSeconds=300&label=latest%20fork%20release)](https://github.com/Vencite/media-playlist-source/releases)
 [![Upstream](https://img.shields.io/badge/upstream-CodeYan01%2Fmedia--playlist--source-181717?logo=github&logoColor=white)](https://github.com/CodeYan01/media-playlist-source)
 [![OBS Studio](https://img.shields.io/badge/OBS%20Studio-tested%20on%20OBS%2032-302E31?logo=obsstudio&logoColor=white)](https://obsproject.com/)
 [![License](https://img.shields.io/github/license/Vencite/media-playlist-source?label=license)](https://github.com/Vencite/media-playlist-source/blob/master/LICENSE)
@@ -32,6 +32,22 @@ The original plugin was created by Ian Rodriguez / CodeYan01.
 - Shuffle with playback history and optional fresh shuffle on activation.
 - Optional folder monitoring with filename/date sorting and file-stability checks.
 - Edit playlists during playback, remember the current entry across OBS restarts, and integrate through obs-websocket.
+
+## New in 0.2.0
+
+- **Live folder monitoring:** update folder contents during playback, choose filename/date sorting, and wait for files to stabilize before adding them.
+- **External control and telemetry:** read playlist entries and timing, select an entry, and change Shuffle/Loop through obs-websocket.
+- **Shuffle improvements:** independent randomization per source, optional fresh shuffle on activation, and fixes to history and prepared-next playback.
+- **Dock refinements:** optional playback toolbar, right-click Shuffle/Loop controls, and a playlist countdown that hides while Loop is enabled.
+- **Reliability fixes:** recover unavailable folders, preserve navigation after the current file is removed, and protect playlist reads during folder updates.
+
+See the [0.2.0 release notes](docs/release-notes/0.2.0.md) for changes since 0.1.5 and known limitations.
+
+## Using MPS with Ontime
+
+For a more convenient [Ontime](https://www.getontime.no/) workflow, pair MPS with [VEN OBS Utils](https://github.com/Vencite/ven-obs-utils/tree/develop), a macOS menu-bar app. It follows the MPS source in Program or a fixed source, and can send current-file and playlist times to up to three independent Ontime auxiliary timers, display a secondary message, and export the current filename to TXT.
+
+See the [media output setup guide](https://github.com/Vencite/ven-obs-utils/blob/develop/MEDIA-BRIDGE.md).
 
 ## Installation
 
@@ -71,3 +87,5 @@ See [integration notes](docs/developer-integration.md) for source settings, play
 Development of this fork uses AI-assisted coding tools where useful, but changes are reviewed, compiled in CI, and validated in OBS before being relied on in production.
 
 Release validation notes are kept in [docs/release-notes](docs/release-notes), and the manual regression checklist is available in [tests/manual-regression.md](tests/manual-regression.md).
+
+For live production, video, photography or 3D work: **VEN.WORKS** — [English](https://ven.works/en/) · [Polish](https://ven.works/).
