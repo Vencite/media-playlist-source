@@ -139,12 +139,13 @@ if(BUILD_TESTING)
   target_link_libraries(playlist-telemetry-runtime-test PRIVATE OBS::libobs)
   add_test(NAME playlist-telemetry-runtime COMMAND playlist-telemetry-runtime-test)
 
+  add_executable(folder-monitor-test tests/folder-monitor-test.c)
+  target_include_directories(folder-monitor-test PRIVATE src)
+  target_link_libraries(folder-monitor-test PRIVATE OBS::libobs)
+  add_test(NAME folder-monitor COMMAND folder-monitor-test)
+  set_tests_properties(folder-monitor PROPERTIES TIMEOUT 30)
+
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_executable(folder-monitor-test tests/folder-monitor-test.c)
-    target_include_directories(folder-monitor-test PRIVATE src)
-    target_link_libraries(folder-monitor-test PRIVATE OBS::libobs)
-    add_test(NAME folder-monitor COMMAND folder-monitor-test)
-    set_tests_properties(folder-monitor PROPERTIES TIMEOUT 30)
     find_package(nlohmann_json 3.11 REQUIRED)
     add_executable(
       playlist-vendor-test

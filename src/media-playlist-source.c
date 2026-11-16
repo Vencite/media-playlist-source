@@ -22,7 +22,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "playlist-telemetry.h"
 #include "duration-inventory.h"
 #include "folder-reconcile.h"
+#include <sys/stat.h>
 
+#define S_FOLDER_ENTRIES "folder_entries"
 #define S_FOLDER_WATCH "folder_watch"
 #define S_FOLDER_SORT "folder_sort"
 #define S_FOLDER_INTERVAL "folder_interval"
@@ -1373,6 +1375,19 @@ static void update_current_filename_setting(struct media_playlist_source *mps, o
 /* Empties path selected in media source,
  * for when there is no item in the list
  */
+/* Playback callers already hold mutex; external OBS save callbacks acquire it below. */
+static void save_playlist_settings_locked(struct media_playlist_source *mps, obs_data_t *settings)
+{
+	if (settings)
+		obs_data_addref(settings);
+	else
+		settings = obs_source_get_settings(mps->source);
+	obs_data_set_int(settings, S_CURRENT_MEDIA_INDEX, mps->current_media_index);
+	obs_data_set_string(settings, S_CURRENT_FOLDER_ITEM_FILENAME, mps->current_media_filename);
+	update_current_filename_setting(mps, settings);
+	obs_data_release(settings);
+}
+
 static void clear_media_source(void *data)
 {
 	struct media_playlist_source *mps = data;
@@ -1543,7 +1558,7 @@ static void play_folder_item_at_index(void *data, size_t index)
 		bfree(mps->current_media_filename);
 		mps->current_media_filename = bstrdup(mps->actual_media->filename);
 		update_media_source(mps, true);
-		obs_source_save(mps->source);
+		save_playlist_settings_locked(mps, NULL);
 	}
 }
 
@@ -1576,7 +1591,7 @@ static void play_media_at_index(void *data, size_t index, bool play_last_folder_
 		return;
 	}
 	update_media_source(mps, true);
-	obs_source_save(mps->source);
+	save_playlist_settings_locked(mps, NULL);
 }
 
 static size_t find_folder_item_index(struct darray *array, const char *filename)
@@ -1717,10 +1732,12 @@ static bool play_selected_clicked(obs_properties_t *props, obs_property_t *prope
 
 		strlist_free(indexes);
 	}
-	obs_data_release(settings);
 	/*update_current_filename_property(
 		mps, obs_properties_get(props, S_CURRENT_FILE_NAME));*/
+	pthread_mutex_lock(&mps->mutex);
 	update_current_filename_setting(mps, settings);
+	pthread_mutex_unlock(&mps->mutex);
+	obs_data_release(settings);
 	//obs_source_update_properties(mps->source);
 
 	signal_handler_signal(sh, "media_next", NULL);
@@ -1733,7 +1750,9 @@ static bool refresh_filename_clicked(obs_properties_t *props, obs_property_t *pr
 	UNUSED_PARAMETER(property);
 	struct media_playlist_source *mps = data;
 	obs_data_t *settings = obs_source_get_settings(mps->source);
+	pthread_mutex_lock(&mps->mutex);
 	update_current_filename_setting(mps, settings);
+	pthread_mutex_unlock(&mps->mutex);
 	obs_source_update_properties(mps->source);
 	obs_data_release(settings);
 	return true;
@@ -2027,7 +2046,7 @@ static void mps_playlist_next(void *data)
 			}
 			mps->current_media_index = mps->current_media->index;
 			update_media_source(mps, true);
-			obs_source_save(mps->source);
+			save_playlist_settings_locked(mps, NULL);
 			switched = true;
 		}
 		goto end;
@@ -2121,7 +2140,7 @@ static void mps_playlist_prev(void *data)
 			}
 			mps->current_media_index = mps->current_media->index;
 			update_media_source(mps, true);
-			obs_source_save(mps->source);
+			save_playlist_settings_locked(mps, NULL);
 			switched = true;
 		}
 		goto end;
@@ -2286,6 +2305,7 @@ static void mps_deactivate(void *data)
 static void folder_orphan_free(struct media_playlist_source *mps);
 static void folder_monitor_tick(struct media_playlist_source *mps);
 static void update_duration_inventory(struct media_playlist_source *mps);
+static void remember_folder_entries(struct media_playlist_source *mps, obs_data_t *settings);
 
 static void mps_destroy(void *data)
 {
@@ -3326,9 +3346,11 @@ static obs_properties_t *mps_properties(void *data)
 	p = obs_properties_add_list(props, S_SELECT_FILE, T_SELECT_FILE, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, T_NO_FILE_SELECTED, "0");
 	if (mps) {
+		pthread_mutex_lock(&mps->mutex);
 		for (size_t i = 0; i < mps->files.num; i++) {
 			add_media_to_selection(p, &mps->files.array[i]);
 		}
+		pthread_mutex_unlock(&mps->mutex);
 	}
 
 	obs_properties_add_button2(props, "play_selected", "Play Selected File", play_selected_clicked, NULL);
@@ -3499,16 +3521,22 @@ static bool folder_apply_result(struct media_playlist_source *mps, struct mps_fo
 	DARRAY(struct media_file_data) replacement;
 	da_init(replacement);
 	bool changed = false;
+	bool promoted = false;
 	pthread_mutex_lock(&mps->mutex);
 	da_copy(replacement, mps->files);
 	for (size_t i = 0; i < replacement.num; ++i) {
 		struct media_file_data *folder = &mps->files.array[i];
-		if (!folder->is_folder)
+		if (!folder->is_folder && !folder->monitor_probe)
 			continue;
 		for (size_t j = 0; j < result->count; ++j) {
 			const struct mps_folder_snapshot *scan = &result->folders[j];
 			if (strcmp(folder->id, scan->id) != 0 || strcmp(folder->path, scan->path) != 0)
 				continue;
+			if (scan->success && !folder->is_folder) {
+				replacement.array[i].is_folder = true;
+				replacement.array[i].monitor_probe = false;
+				promoted = changed = true;
+			}
 			struct darray children;
 			if (mps_folder_reconcile(folder, scan, folder_previous_scan(mps, scan), mps->folder_sort,
 						 mps->folder_wait, &children)) {
@@ -3551,7 +3579,7 @@ static bool folder_apply_result(struct media_playlist_source *mps, struct mps_fo
 	mps->current_media = current_top < mps->files.num ? &mps->files.array[current_top] : NULL;
 	mps->actual_media = mps->current_media;
 	bool current_found = !current_name;
-	if (!current || current->is_folder) {
+	if (!current || (!current_name && mps->actual_media && mps->actual_media->is_folder)) {
 		/* Discovering the first file establishes a valid selection, without starting stopped playback. */
 		mps->actual_media = NULL;
 		for (size_t i = 0; i < mps->files.num; ++i) {
@@ -3640,6 +3668,11 @@ static bool folder_apply_result(struct media_playlist_source *mps, struct mps_fo
 	}
 	rebind_active_slot_metadata(mps);
 	update_duration_inventory(mps);
+	if (promoted) {
+		obs_data_t *settings = obs_source_get_settings(mps->source);
+		remember_folder_entries(mps, settings);
+		obs_data_release(settings);
+	}
 	/* A prepared next cycle must not reopen the committed current pass. */
 	mps_playlist_change_notify(mps);
 	return true;
@@ -3677,7 +3710,7 @@ static void folder_monitor_configure(struct media_playlist_source *mps, obs_data
 	pthread_mutex_lock(&mps->mutex);
 	for (size_t i = 0; mps->folder_watch && i < mps->files.num; ++i) {
 		struct media_file_data *folder = &mps->files.array[i];
-		if (!folder->is_folder)
+		if (!folder->is_folder && !folder->monitor_probe)
 			continue;
 		da_push_back(ids, &folder->id);
 		da_push_back(paths, &folder->path);
@@ -3687,6 +3720,26 @@ static void folder_monitor_configure(struct media_playlist_source *mps, obs_data
 	pthread_mutex_unlock(&mps->mutex);
 	da_free(ids);
 	da_free(paths);
+}
+
+/* Persist only folder identity/path, never discovered children or scan state. */
+static void remember_folder_entries(struct media_playlist_source *mps, obs_data_t *settings)
+{
+	obs_data_array_t *folders = obs_data_array_create();
+	pthread_mutex_lock(&mps->mutex);
+	for (size_t i = 0; i < mps->files.num; ++i) {
+		const struct media_file_data *file = &mps->files.array[i];
+		if (!file->is_folder)
+			continue;
+		obs_data_t *folder = obs_data_create();
+		obs_data_set_string(folder, S_ID, file->id);
+		obs_data_set_string(folder, "path", file->path);
+		obs_data_array_push_back(folders, folder);
+		obs_data_release(folder);
+	}
+	pthread_mutex_unlock(&mps->mutex);
+	obs_data_set_array(settings, S_FOLDER_ENTRIES, folders);
+	obs_data_array_release(folders);
 }
 
 static char *folder_settings_baseline(obs_data_t *settings)
@@ -3719,7 +3772,7 @@ static char *folder_settings_baseline(obs_data_t *settings)
 }
 
 static void add_monitored_file(struct media_playlist_source *mps, struct darray *array, const char *path,
-			       const char *id)
+			       const char *id, obs_data_t *settings)
 {
 	if (mps->folder_watch) {
 		for (size_t i = 0; i < mps->files.num; ++i) {
@@ -3746,6 +3799,28 @@ static void add_monitored_file(struct media_playlist_source *mps, struct darray 
 		}
 	}
 	add_file(array, path, id);
+	DARRAY(struct media_file_data) files;
+	files.da = *array;
+	struct media_file_data *added = &files.array[files.num - 1];
+	if (added->is_folder || added->is_url)
+		return;
+	obs_data_array_t *folders = obs_data_get_array(settings, S_FOLDER_ENTRIES);
+	for (size_t i = 0; i < obs_data_array_count(folders); ++i) {
+		obs_data_t *folder = obs_data_array_item(folders, i);
+		bool matches = strcmp(obs_data_get_string(folder, S_ID), id) == 0 &&
+			       strcmp(obs_data_get_string(folder, "path"), path) == 0;
+		obs_data_release(folder);
+		if (matches) {
+			added->is_folder = true;
+			break;
+		}
+	}
+	obs_data_array_release(folders);
+	if (!added->is_folder) {
+		struct stat info;
+		/* Legacy collections have no type hint: retry unresolved local paths off-thread. */
+		added->monitor_probe = os_stat(path, &info) != 0;
+	}
 }
 
 static void mps_update(void *data, obs_data_t *settings)
@@ -3866,7 +3941,7 @@ static void mps_update(void *data, obs_data_t *settings)
 			if (old_media_path)
 				item_edited = strcmp(old_media_path, path) != 0;
 		}
-		add_monitored_file(mps, &new_files.da, path, id);
+		add_monitored_file(mps, &new_files.da, path, id, settings);
 		obs_data_release(item);
 	}
 	set_parents(&new_files.da);
@@ -3969,6 +4044,7 @@ static void mps_update(void *data, obs_data_t *settings)
 		clear_media_source(mps);
 	}
 	rebind_active_slot_metadata(mps);
+	remember_folder_entries(mps, settings);
 	obs_source_save(mps->source);
 
 	/* So Current File Name is updated */
@@ -4003,9 +4079,9 @@ static void mps_update(void *data, obs_data_t *settings)
 static void mps_save(void *data, obs_data_t *settings)
 {
 	struct media_playlist_source *mps = data;
-	obs_data_set_int(settings, S_CURRENT_MEDIA_INDEX, mps->current_media_index);
-	obs_data_set_string(settings, S_CURRENT_FOLDER_ITEM_FILENAME, mps->current_media_filename);
-	update_current_filename_setting(mps, settings);
+	pthread_mutex_lock(&mps->mutex);
+	save_playlist_settings_locked(mps, settings);
+	pthread_mutex_unlock(&mps->mutex);
 }
 
 static void mps_load(void *data, obs_data_t *settings)

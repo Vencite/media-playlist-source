@@ -125,6 +125,8 @@ struct media_playlist_source {
 	size_t consecutive_failures;
 	pthread_mutex_t lifecycle_mutex;
 
+	/* OBS_SOURCE_VIDEO defers update before video_tick on the same thread.
+	 * Monitoring state belongs to that thread; the worker only owns copied paths/results. */
 	struct mps_folder_monitor *folder_monitor;
 	struct mps_folder_result *folder_previous;
 	struct media_file_data *folder_orphan;

@@ -219,3 +219,5 @@ Use a local-video playlist `A -> B` and verify each behavior independently:
 3. Change other files while playing: active playback and unaffected preload must continue. Remove current/next files and verify deterministic recovery without stale preload.
 4. Check Shuffle/Loop, Previous/Next, pause/stop/visibility, multiple folders and independent sources; docks/API must update only on effective changes.
 5. Disconnect/reconnect a folder: retain its last contents while unavailable. Toggle monitoring and delete sources during scans; check clean OBS shutdown.
+
+6. Start OBS with a watched folder unavailable, then reconnect it. Repeat on SMB/NAS and measure recovery and shutdown; one blocked filesystem call currently delays other monitors.

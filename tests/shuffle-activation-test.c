@@ -454,11 +454,19 @@ static void *folder_fake_decoder_create(obs_data_t *settings, obs_source_t *sour
 	return bzalloc(1);
 }
 
+static uint32_t folder_fake_decoder_size(void *data)
+{
+	UNUSED_PARAMETER(data);
+	return 64;
+}
+
 static struct obs_source_info folder_fake_decoder = {
 	.id = "ffmpeg_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
 	.output_flags = OBS_SOURCE_VIDEO,
 	.get_name = mps_getname,
+	.get_width = folder_fake_decoder_size,
+	.get_height = folder_fake_decoder_size,
 	.create = folder_fake_decoder_create,
 	.destroy = bfree,
 };
@@ -604,6 +612,207 @@ static void test_empty_watched_folder_becomes_selectable_without_autoplay(void)
 	obs_source_release(source);
 }
 
+static void test_unavailable_saved_folder_keeps_type(void)
+{
+	obs_source_t *source = create_playlist(1, SHUFFLE_RESET_PRESERVE);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	obs_data_t *settings = obs_source_get_settings(source);
+	obs_data_array_t *folders = obs_data_array_create();
+	obs_data_t *folder = obs_data_create();
+	obs_data_set_string(folder, "uuid", "item0");
+	obs_data_set_string(folder, "path", "clip0.mp4");
+	obs_data_array_push_back(folders, folder);
+	obs_data_release(folder);
+	obs_data_set_array(settings, "folder_entries", folders);
+	obs_data_array_release(folders);
+	obs_data_set_bool(settings, S_FOLDER_WATCH, true);
+	/* Force an ordinary update, as on initial source load. */
+	obs_data_set_int(settings, S_SPEED, 101);
+	mps_update(mps, settings);
+	assert(mps->files.array[0].is_folder);
+	assert(mps->files.array[0].folder_items.num == 0);
+	obs_data_release(settings);
+	obs_source_release(source);
+}
+
+static void test_legacy_unavailable_folder_recovers_and_persists_type(void)
+{
+	obs_source_t *source = create_playlist(1, SHUFFLE_RESET_PRESERVE);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	obs_data_t *settings = obs_source_get_settings(source);
+	obs_data_set_bool(settings, S_FOLDER_WATCH, true);
+	assert(!mps->folder_watch);
+	assert(mps->files.array[0].monitor_probe);
+	mps_update(mps, settings);
+	assert(mps->files.array[0].monitor_probe);
+	assert(!mps->files.array[0].is_folder);
+	cancel_pending_transition(mps, true, false);
+	mps->folder_wait = false;
+	struct mps_folder_entry entry = {.name = "returned.mp4", .size = 10};
+	struct mps_folder_snapshot scan = {.id = mps->files.array[0].id,
+					   .path = mps->files.array[0].path,
+					   .success = true,
+					   .entries = &entry,
+					   .count = 1};
+	struct mps_folder_result result = {.generation = mps->folder_generation, .folders = &scan, .count = 1};
+	assert(folder_apply_result(mps, &result));
+	assert(mps->files.array[0].is_folder);
+	assert(!mps->files.array[0].monitor_probe);
+	assert(mps->actual_media && !mps->actual_media->is_folder);
+	assert(strcmp(mps->actual_media->filename, "returned.mp4") == 0);
+	obs_data_array_t *saved = obs_data_get_array(settings, S_FOLDER_ENTRIES);
+	assert(obs_data_array_count(saved) == 1);
+	obs_data_array_release(saved);
+	obs_source_t *reloaded =
+		obs_source_create("media_playlist_source_codeyan", "offline folder reload", settings, NULL);
+	assert(reloaded);
+	struct media_playlist_source *other = obs_obj_get_data(reloaded);
+	mps_update(other, settings);
+	assert(other->files.array[0].is_folder);
+	assert(other->files.array[0].folder_items.num == 0);
+	obs_source_release(reloaded);
+	obs_data_release(settings);
+	obs_source_release(source);
+}
+
+struct folder_ui_update_test {
+	obs_source_t *source;
+	pthread_mutex_t mutex;
+	pthread_cond_t condition;
+	bool start;
+	bool read_snapshot;
+};
+
+static void *send_folder_ui_updates(void *data)
+{
+	struct folder_ui_update_test *test = data;
+	pthread_mutex_lock(&test->mutex);
+	while (!test->start)
+		pthread_cond_wait(&test->condition, &test->mutex);
+	pthread_mutex_unlock(&test->mutex);
+	for (size_t i = 0; i < 1000; ++i) {
+		obs_data_t *settings = obs_data_create();
+		if (test->read_snapshot) {
+			struct media_playlist_source *mps = obs_obj_get_data(test->source);
+			mps_save(mps, settings);
+			assert(strstr(obs_data_get_string(settings, S_CURRENT_FILE_NAME), "a.mp4"));
+			obs_properties_t *props = mps_properties(mps);
+			obs_properties_destroy(props);
+		} else {
+			obs_data_set_bool(settings, S_FOLDER_WATCH, i % 2 != 0);
+			obs_source_update(test->source, settings);
+		}
+		obs_data_release(settings);
+	}
+	return NULL;
+}
+
+static void test_folder_ui_updates_are_deferred_during_reconciliation(void)
+{
+	obs_source_t *source;
+	struct media_file_data *folder = test_folder_source(&source, false);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	struct mps_folder_entry entries[] = {{.name = "a.mp4", .size = 10},
+					     {.name = "b.mp4", .size = 20},
+					     {.name = "c.mp4", .size = 30}};
+	struct mps_folder_snapshot scan = {.id = folder->id,
+					   .path = folder->path,
+					   .success = true,
+					   .entries = entries,
+					   .count = 3};
+	struct mps_folder_result result = {.generation = 7, .folders = &scan, .count = 1};
+	struct folder_ui_update_test test = {.source = source,
+					     .mutex = PTHREAD_MUTEX_INITIALIZER,
+					     .condition = PTHREAD_COND_INITIALIZER};
+	pthread_t ui;
+	assert(pthread_create(&ui, NULL, send_folder_ui_updates, &test) == 0);
+	pthread_mutex_lock(&test.mutex);
+	test.start = true;
+	pthread_cond_signal(&test.condition);
+	pthread_mutex_unlock(&test.mutex);
+	for (size_t i = 0; i < 1000; ++i) {
+		assert(!folder_apply_result(mps, &result));
+		assert(mps->folder_generation == 7);
+		assert(mps->folder_watch);
+	}
+	pthread_join(ui, NULL);
+	/* OBS_SOURCE_VIDEO queues UI updates; only the video-thread dispatch applies them. */
+	assert(mps->folder_generation == 7);
+	obs_data_t *settings = obs_source_get_settings(source);
+	folder_monitor_configure(mps, settings);
+	assert(mps->folder_generation == 8);
+	obs_data_release(settings);
+	pthread_cond_destroy(&test.condition);
+	pthread_mutex_destroy(&test.mutex);
+	obs_source_release(source);
+}
+
+static void test_folder_properties_and_save_during_reconciliation(void)
+{
+	obs_source_t *source;
+	struct media_file_data *folder = test_folder_source(&source, false);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	struct mps_folder_entry entries[] = {{.name = "a.mp4", .size = 10},
+					     {.name = "b.mp4", .size = 20},
+					     {.name = "c.mp4", .size = 30}};
+	struct mps_folder_snapshot scan = {.id = folder->id,
+					   .path = folder->path,
+					   .success = true,
+					   .entries = entries,
+					   .count = 3};
+	struct mps_folder_result result = {.generation = 7, .folders = &scan, .count = 1};
+	struct folder_ui_update_test test = {.source = source,
+					     .mutex = PTHREAD_MUTEX_INITIALIZER,
+					     .condition = PTHREAD_COND_INITIALIZER,
+					     .read_snapshot = true};
+	pthread_t ui;
+	assert(pthread_create(&ui, NULL, send_folder_ui_updates, &test) == 0);
+	pthread_mutex_lock(&test.mutex);
+	test.start = true;
+	pthread_cond_signal(&test.condition);
+	pthread_mutex_unlock(&test.mutex);
+	for (size_t i = 0; i < 1000; ++i) {
+		mps->folder_sort = i % 2 ? MPS_FOLDER_AZ : MPS_FOLDER_ZA;
+		assert(folder_apply_result(mps, &result));
+	}
+	pthread_join(ui, NULL);
+	pthread_cond_destroy(&test.condition);
+	pthread_mutex_destroy(&test.mutex);
+	obs_source_release(source);
+}
+
+static void test_folder_recovery_preserves_current_in_later_folder(void)
+{
+	obs_source_t *source;
+	test_folder_source(&source, false);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	da_swap(mps->files, 0, 1);
+	mps->files.array[0].index = 0;
+	mps->files.array[1].index = 1;
+	set_parents(&mps->files.da);
+	struct media_file_data *folder = &mps->files.array[1];
+	mps->current_media = folder;
+	mps->current_media_index = 1;
+	mps->actual_media = &folder->folder_items.array[0];
+	struct mps_folder_entry entries[] = {{.name = "a.mp4", .size = 10},
+					     {.name = "b.mp4", .size = 20},
+					     {.name = "c.mp4", .size = 30},
+					     {.name = "d.mp4", .size = 40}};
+	struct mps_folder_snapshot scan = {.id = folder->id,
+					   .path = folder->path,
+					   .success = true,
+					   .entries = entries,
+					   .count = 4};
+	struct mps_folder_result result = {.generation = 7, .folders = &scan, .count = 1};
+	assert(folder_apply_result(mps, &result));
+	assert(mps->current_media_index == 1);
+	assert(mps->current_media == &mps->files.array[1]);
+	assert(mps->actual_media->parent == mps->current_media);
+	assert(mps->actual_media != mps->folder_orphan);
+	assert(strcmp(mps->actual_media->filename, "a.mp4") == 0);
+	obs_source_release(source);
+}
+
 static void destroy_queue_barrier(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -614,6 +823,11 @@ int main(void)
 	assert(obs_startup("en-US", NULL, NULL));
 	obs_register_source(&media_playlist_source_info);
 	obs_register_source(&folder_fake_decoder);
+	test_folder_recovery_preserves_current_in_later_folder();
+	test_folder_properties_and_save_during_reconciliation();
+	test_folder_ui_updates_are_deferred_during_reconciliation();
+	test_legacy_unavailable_folder_recovers_and_persists_type();
+	test_unavailable_saved_folder_keeps_type();
 	test_empty_watched_folder_becomes_selectable_without_autoplay();
 	test_folder_properties_visibility();
 	test_folder_preserves_unaffected_decoder_and_preload();

@@ -100,6 +100,17 @@ runs:
 
         .github/scripts/Build-Windows.ps1 @BuildArgs
 
+    - name: Run Windows Folder Regression Tests
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $DllDirectories = Get-ChildItem .deps -Recurse -Filter *.dll |
+          Where-Object { $_.FullName -notmatch '[\\/]Debug[\\/]' } |
+          Select-Object -ExpandProperty DirectoryName -Unique
+        $Env:PATH = ($DllDirectories -join ';') + ';' + $Env:PATH
+        ctest --test-dir 'build_${{ inputs.target }}' -C '${{ inputs.config }}' -R '^folder-(monitor|reconcile)$' --output-on-failure
+        if ($LASTEXITCODE -ne 0) { throw 'Folder regression tests failed' }
+
     - name: Create Summary 📊
       if: contains(fromJSON('["Linux", "macOS"]'),runner.os)
       shell: zsh --no-rcs --errexit --pipefail {0}
