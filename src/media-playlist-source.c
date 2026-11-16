@@ -2147,7 +2147,15 @@ static void mps_playlist_prev(void *data)
 	}
 
 	if (mps->current_media->is_folder) {
-		if (mps->current_folder_item_index > 0) {
+		/* An orphan cursor points at its retained predecessor, not at a playing entry. */
+		if (mps->folder_orphan && mps->actual_media == mps->folder_orphan &&
+		    mps->current_folder_item_index < mps->current_media->folder_items.num) {
+			play_folder_item_at_index(mps, mps->current_folder_item_index);
+			switched = true;
+			goto end;
+		}
+		if (mps->current_folder_item_index > 0 &&
+		    mps->current_folder_item_index <= mps->current_media->folder_items.num) {
 			--mps->current_folder_item_index;
 			play_folder_item_at_index(mps, mps->current_folder_item_index);
 			switched = true;
@@ -2919,10 +2927,14 @@ static bool playlist_has_previous(struct media_playlist_source *mps)
 	pthread_mutex_lock(&mps->mutex);
 	if (mps->shuffle) {
 		has_previous = shuffler_has_prev(&mps->shuffler);
+	} else if (mps->current_media && mps->current_media->is_folder && mps->folder_orphan &&
+		   mps->actual_media == mps->folder_orphan &&
+		   mps->current_folder_item_index < mps->current_media->folder_items.num) {
+		has_previous = true;
 	} else {
-		has_previous = mps->current_media &&
-			       ((mps->current_media->is_folder && mps->current_folder_item_index > 0) ||
-				mps->current_media_index > 0 || (mps->loop && mps->files.num > 0));
+		has_previous = mps_previous_sequential_media(&mps->files.da, mps->current_media,
+							     mps->current_media_index, mps->current_folder_item_index,
+							     mps->loop) != NULL;
 	}
 	pthread_mutex_unlock(&mps->mutex);
 	return has_previous;
@@ -3523,8 +3535,7 @@ static bool folder_apply_result(struct media_playlist_source *mps, struct mps_fo
 	bool changed = false;
 	bool promoted = false;
 	pthread_mutex_lock(&mps->mutex);
-	da_copy(replacement, mps->files);
-	for (size_t i = 0; i < replacement.num; ++i) {
+	for (size_t i = 0; i < mps->files.num; ++i) {
 		struct media_file_data *folder = &mps->files.array[i];
 		if (!folder->is_folder && !folder->monitor_probe)
 			continue;
@@ -3533,6 +3544,8 @@ static bool folder_apply_result(struct media_playlist_source *mps, struct mps_fo
 			if (strcmp(folder->id, scan->id) != 0 || strcmp(folder->path, scan->path) != 0)
 				continue;
 			if (scan->success && !folder->is_folder) {
+				if (!replacement.array)
+					da_copy(replacement, mps->files);
 				replacement.array[i].is_folder = true;
 				replacement.array[i].monitor_probe = false;
 				promoted = changed = true;
@@ -3540,6 +3553,8 @@ static bool folder_apply_result(struct media_playlist_source *mps, struct mps_fo
 			struct darray children;
 			if (mps_folder_reconcile(folder, scan, folder_previous_scan(mps, scan), mps->folder_sort,
 						 mps->folder_wait, &children)) {
+				if (!replacement.array)
+					da_copy(replacement, mps->files);
 				replacement.array[i].folder_items.da = children;
 				changed = true;
 			}

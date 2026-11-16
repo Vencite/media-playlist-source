@@ -1,7 +1,5 @@
 #include "duration-inventory.h"
-
-#include <sys/stat.h>
-#include <sys/types.h>
+#include "file-metadata.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -18,10 +16,6 @@
 #include <util/threading.h>
 
 #include <string.h>
-
-#ifndef S_ISREG
-#define S_ISREG(mode) (((mode) & S_IFMT) == S_IFREG)
-#endif
 
 /* A cached identity is checked against the file system this often. */
 #define RECHECK_INTERVAL_NS (UINT64_C(10) * 1000 * 1000 * 1000)
@@ -204,28 +198,9 @@ static bool duration_id_matches(const struct mps_duration_file_id *left, const s
 	       strcmp(left->path, right->path) == 0;
 }
 
-/* Sub-second part of the modification time. os_stat() only reports whole
- * seconds on Windows, so a same-size rewrite within one second is not detected
- * there; the field stays 0 and the identity comparison sees no change. */
-static int64_t duration_stat_mtime_nsec(const struct stat *info)
-{
-#if defined(__APPLE__)
-	return (int64_t)info->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-	UNUSED_PARAMETER(info);
-	return 0;
-#elif defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200809L
-	return (int64_t)info->st_mtim.tv_nsec;
-#else
-	/* Strict ISO builds hide st_mtim, so only whole seconds are compared. */
-	UNUSED_PARAMETER(info);
-	return 0;
-#endif
-}
-
 static bool duration_identify(void *opaque, const char *path, struct mps_duration_file_id *id)
 {
-	struct stat info;
+	struct mps_file_metadata info;
 	char *absolute;
 
 	UNUSED_PARAMETER(opaque);
@@ -240,15 +215,15 @@ static bool duration_identify(void *opaque, const char *path, struct mps_duratio
 	if (!absolute)
 		return false;
 
-	if (os_stat(absolute, &info) != 0 || !S_ISREG(info.st_mode)) {
+	if (mps_file_metadata_read(absolute, &info) != 1) {
 		bfree(absolute);
 		return false;
 	}
 
 	id->path = absolute;
-	id->size = (int64_t)info.st_size;
-	id->mtime_sec = (int64_t)info.st_mtime;
-	id->mtime_nsec = duration_stat_mtime_nsec(&info);
+	id->size = info.size;
+	id->mtime_sec = info.mtime_sec;
+	id->mtime_nsec = info.mtime_nsec;
 	id->valid = true;
 	return true;
 }

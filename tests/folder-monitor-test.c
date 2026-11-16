@@ -15,6 +15,7 @@ static os_dir_t *gated_opendir(const char *path);
 #include "../src/folder-monitor.c"
 #undef os_opendir
 #include "../src/folder-reconcile.c"
+#include "../src/duration-inventory.c"
 
 static struct {
 	pthread_mutex_t mutex;
@@ -162,6 +163,10 @@ static void test_same_size_overwrite(const char *directory)
 {
 	set_mtime(directory, "A.MOV", 100000100);
 	set_mtime(directory, "b.mp4", 200000200);
+	char path[512];
+	snprintf(path, sizeof(path), "%s/A.MOV", directory);
+	struct mps_duration_file_id first_id, second_id;
+	assert(duration_identify(NULL, path, &first_id));
 	struct mps_folder_monitor monitor = {0};
 	struct mps_folder_snapshot first = {.path = bstrdup(directory), .id = bstrdup("folder-id")};
 	size_t examined = 0;
@@ -185,6 +190,13 @@ static void test_same_size_overwrite(const char *directory)
 	assert(second.entries[0].mtime == first.entries[0].mtime);
 	assert(second.entries[0].mtime_nsec == 300000300);
 	assert(!equal_stamp(&first.entries[0], &second.entries[0]));
+	assert(duration_identify(NULL, path, &second_id));
+	assert(first_id.size == second_id.size);
+	assert(first_id.mtime_sec == second_id.mtime_sec);
+	assert(first_id.mtime_nsec != second_id.mtime_nsec);
+	assert(!duration_id_matches(&first_id, &second_id));
+	bfree(first_id.path);
+	bfree(second_id.path);
 	assert(mps_folder_reconcile(&folder, &second, NULL, MPS_FOLDER_NEWEST, false, &children));
 	assert(strcmp(((struct media_file_data *)children.array)[0].filename, "A.MOV") == 0);
 	mps_folder_children_free(&children);
@@ -195,6 +207,45 @@ static void test_same_size_overwrite(const char *directory)
 	result->folders[1] = second;
 	mps_folder_result_free(result);
 }
+
+#ifdef _WIN32
+static void test_case_only_rename(const char *directory)
+{
+	struct mps_folder_monitor monitor = {0};
+	struct mps_folder_snapshot first = {.path = bstrdup(directory), .id = bstrdup("case-folder")};
+	size_t examined = 0;
+	scan_folder(&monitor, 0, &first, &examined);
+	assert(first.success && first.count == 2);
+	struct media_file_data folder = {.path = (char *)directory, .id = "case-folder"};
+	struct darray children;
+	assert(mps_folder_reconcile(&folder, &first, NULL, MPS_FOLDER_KEEP, false, &children));
+	folder.folder_items.da = children;
+	char old_path[512], new_path[512];
+	snprintf(old_path, sizeof(old_path), "%s/A.MOV", directory);
+	snprintf(new_path, sizeof(new_path), "%s/a.mov", directory);
+	assert(os_rename(old_path, new_path) == 0);
+	struct mps_folder_snapshot renamed = {.path = bstrdup(directory), .id = bstrdup("case-folder")};
+	examined = 0;
+	scan_folder(&monitor, 0, &renamed, &examined);
+	assert(renamed.success && renamed.count == 2);
+	assert(mps_folder_reconcile(&folder, &renamed, &first, MPS_FOLDER_KEEP, true, &children));
+	assert(children.num == 1);
+	mps_folder_children_free(&folder.folder_items.da);
+	folder.folder_items.da = children;
+	assert(mps_folder_reconcile(&folder, &renamed, &renamed, MPS_FOLDER_KEEP, true, &children));
+	assert(children.num == 2);
+	assert(strcmp(((struct media_file_data *)children.array)[1].filename, "a.mov") == 0);
+	mps_folder_children_free(&children);
+	mps_folder_children_free(&folder.folder_items.da);
+	assert(os_rename(new_path, old_path) == 0);
+	struct mps_folder_result *result = bzalloc(sizeof(*result));
+	result->count = 2;
+	result->folders = bzalloc(2 * sizeof(*result->folders));
+	result->folders[0] = first;
+	result->folders[1] = renamed;
+	mps_folder_result_free(result);
+}
+#endif
 
 int main(void)
 {
@@ -217,6 +268,9 @@ int main(void)
 	assert(r->folders[0].entries[0].size == 3);
 	mps_folder_result_free(r);
 	test_same_size_overwrite(dir);
+#ifdef _WIN32
+	test_case_only_rename(dir);
+#endif
 	r = bzalloc(sizeof(*r));
 	r->count = 1;
 	r->folders = bzalloc(sizeof(*r->folders));

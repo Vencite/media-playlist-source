@@ -51,6 +51,7 @@ target_sources(
     src/playlist-context.c
     src/playlist-telemetry.h
     src/playlist-telemetry.c
+    src/file-metadata.h
     src/duration-inventory.h
     src/duration-inventory.c
     src/playlist-vendor.h
@@ -74,7 +75,7 @@ endif()
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
 if(BUILD_TESTING)
-  add_executable(folder-reconcile-test tests/folder-reconcile-test.c src/folder-reconcile.c)
+  add_executable(folder-reconcile-test tests/folder-reconcile-test.c)
   target_include_directories(folder-reconcile-test PRIVATE src)
   target_link_libraries(folder-reconcile-test PRIVATE OBS::libobs)
   add_test(NAME folder-reconcile COMMAND folder-reconcile-test)

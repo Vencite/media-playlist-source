@@ -1,4 +1,5 @@
 #include "folder-monitor.h"
+#include "file-metadata.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -138,55 +139,6 @@ static bool supported(const char *name)
 	return valid;
 }
 
-/* Return -1 on failure, 0 for non-files, 1 for a regular file. */
-static int file_metadata(const char *path, struct mps_folder_entry *entry)
-{
-#ifdef _WIN32
-	wchar_t *wide = NULL;
-	if (!os_utf8_to_wcs_ptr(path, 0, &wide))
-		return -1;
-	/* Follow links and allow concurrent copying, playback, deletion and renames. */
-	HANDLE file = CreateFileW(wide, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-				  FILE_FLAG_BACKUP_SEMANTICS, NULL);
-	bfree(wide);
-	if (file == INVALID_HANDLE_VALUE)
-		return -1;
-	BY_HANDLE_FILE_INFORMATION info;
-	bool success = GetFileInformationByHandle(file, &info) != 0;
-	CloseHandle(file);
-	if (!success)
-		return -1;
-	if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-		return 0;
-	ULARGE_INTEGER size = {.LowPart = info.nFileSizeLow, .HighPart = info.nFileSizeHigh};
-	ULARGE_INTEGER stamp = {.LowPart = info.ftLastWriteTime.dwLowDateTime,
-				.HighPart = info.ftLastWriteTime.dwHighDateTime};
-	if (size.QuadPart > INT64_MAX)
-		return -1;
-	entry->size = (int64_t)size.QuadPart;
-	/* FILETIME counts 100 ns intervals from 1601; keep the Unix epoch used by stat. */
-	entry->mtime = (int64_t)(stamp.QuadPart / UINT64_C(10000000)) - INT64_C(11644473600);
-	entry->mtime_nsec = (int64_t)(stamp.QuadPart % UINT64_C(10000000)) * 100;
-#else
-	struct stat info;
-	if (os_stat(path, &info) != 0)
-		return -1;
-	if (!S_ISREG(info.st_mode))
-		return 0;
-	entry->size = (int64_t)info.st_size;
-	entry->mtime = (int64_t)info.st_mtime;
-#if defined(__APPLE__)
-	entry->mtime_nsec = info.st_mtimespec.tv_nsec;
-#elif defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200809L
-	entry->mtime_nsec = info.st_mtim.tv_nsec;
-#else
-	/* shortcut: strict ISO stat hides subsecond fields; enable POSIX fields if needed. */
-	entry->mtime_nsec = 0;
-#endif
-#endif
-	return 1;
-}
-
 static int compare_entries(const void *left, const void *right)
 {
 	return strcmp(((const struct mps_folder_entry *)left)->name, ((const struct mps_folder_entry *)right)->name);
@@ -231,8 +183,8 @@ static void scan_folder(struct mps_folder_monitor *monitor, uint64_t serial, str
 		dstr_copy(&path, folder->path);
 		dstr_cat_ch(&path, '/');
 		dstr_cat(&path, ent->d_name);
-		struct mps_folder_entry entry = {0};
-		int metadata = path.len < MAX_PATH_BYTES ? file_metadata(path.array, &entry) : -1;
+		struct mps_file_metadata info;
+		int metadata = path.len < MAX_PATH_BYTES ? mps_file_metadata_read(path.array, &info) : -1;
 		dstr_free(&path);
 		if (metadata < 0) {
 			success = false;
@@ -240,7 +192,10 @@ static void scan_folder(struct mps_folder_monitor *monitor, uint64_t serial, str
 		}
 		if (!metadata)
 			continue;
-		entry.name = bstrdup(ent->d_name);
+		struct mps_folder_entry entry = {.name = bstrdup(ent->d_name),
+						 .size = info.size,
+						 .mtime = info.mtime_sec,
+						 .mtime_nsec = info.mtime_nsec};
 		da_push_back(entries, &entry);
 	}
 	os_closedir(dir);

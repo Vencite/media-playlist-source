@@ -813,6 +813,73 @@ static void test_folder_recovery_preserves_current_in_later_folder(void)
 	obs_source_release(source);
 }
 
+static void test_previous_after_removing_first_current_folder_item(void)
+{
+	for (int mode = 0; mode < 3; ++mode) {
+		obs_source_t *source;
+		struct media_file_data *folder = test_folder_source(&source, false);
+		struct media_playlist_source *mps = obs_obj_get_data(source);
+		if (mode == 1) {
+			da_swap(mps->files, 0, 1);
+			mps->files.array[0].index = 0;
+			mps->files.array[1].index = 1;
+			set_parents(&mps->files.da);
+			folder = &mps->files.array[1];
+			mps->current_media = folder;
+			mps->current_media_index = 1;
+			mps->actual_media = &folder->folder_items.array[0];
+		}
+		mps->loop = mode == 2;
+		struct mps_folder_entry entries[] = {{.name = "b.mp4", .size = 20}, {.name = "c.mp4", .size = 30}};
+		struct mps_folder_snapshot scan = {.id = folder->id,
+						   .path = folder->path,
+						   .success = true,
+						   .entries = entries,
+						   .count = 2};
+		struct mps_folder_result result = {.generation = 7, .folders = &scan, .count = 1};
+		assert(folder_apply_result(mps, &result));
+		assert(mps->current_folder_item_index == SIZE_MAX);
+		uint64_t generation = mps->coordinator.generation;
+		mps_playlist_prev(mps);
+		if (mode == 0) {
+			assert(!mps->coordinator.request_pending);
+			assert(mps->coordinator.generation == generation);
+			assert(mps->actual_media == mps->folder_orphan);
+		} else {
+			assert(mps->coordinator.request_pending);
+			assert(mps->actual_media != mps->folder_orphan);
+			assert(!mps->actual_media->is_folder);
+			assert(strcmp(mps->actual_media->path, "clip1.mp4") == 0);
+		}
+		obs_source_release(source);
+	}
+}
+
+static void test_previous_after_removing_later_current_folder_item(void)
+{
+	for (size_t removed = 1; removed <= 2; ++removed) {
+		obs_source_t *source;
+		struct media_file_data *folder = test_folder_source(&source, false);
+		struct media_playlist_source *mps = obs_obj_get_data(source);
+		mps->actual_media = &folder->folder_items.array[removed];
+		mps->current_folder_item_index = removed;
+		struct mps_folder_entry entries[] = {{.name = "a.mp4", .size = 10},
+						     {.name = removed == 1 ? "c.mp4" : "b.mp4", .size = 30}};
+		struct mps_folder_snapshot scan = {.id = folder->id,
+						   .path = folder->path,
+						   .success = true,
+						   .entries = entries,
+						   .count = 2};
+		struct mps_folder_result result = {.generation = 7, .folders = &scan, .count = 1};
+		assert(folder_apply_result(mps, &result));
+		mps_playlist_prev(mps);
+		assert(mps->coordinator.request_pending);
+		assert(mps->actual_media != mps->folder_orphan);
+		assert(strcmp(mps->actual_media->filename, removed == 1 ? "a.mp4" : "b.mp4") == 0);
+		obs_source_release(source);
+	}
+}
+
 static void destroy_queue_barrier(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -823,6 +890,8 @@ int main(void)
 	assert(obs_startup("en-US", NULL, NULL));
 	obs_register_source(&media_playlist_source_info);
 	obs_register_source(&folder_fake_decoder);
+	test_previous_after_removing_later_current_folder_item();
+	test_previous_after_removing_first_current_folder_item();
 	test_folder_recovery_preserves_current_in_later_folder();
 	test_folder_properties_and_save_during_reconciliation();
 	test_folder_ui_updates_are_deferred_during_reconciliation();

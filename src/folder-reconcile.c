@@ -70,6 +70,50 @@ static int by_date_reverse(const void *a, const void *b)
 	return by_name(a, b);
 }
 
+static int (*sort_compare(enum mps_folder_sort sort))(const void *, const void *)
+{
+	switch (sort) {
+	case MPS_FOLDER_AZ:
+		return by_name;
+	case MPS_FOLDER_ZA:
+		return by_name_reverse;
+	case MPS_FOLDER_OLDEST:
+		return by_date;
+	case MPS_FOLDER_NEWEST:
+		return by_date_reverse;
+	default:
+		return NULL;
+	}
+}
+
+/* Count stable candidates without copying names, sorting, or allocating a second list. */
+static bool effective_change(struct media_file_data *folder, const struct mps_folder_snapshot *scan,
+			     const struct mps_folder_snapshot *previous, enum mps_folder_sort sort, bool wait)
+{
+	size_t admitted_ready = 0, scanned_ready = 0;
+	for (size_t i = 0; i < folder->folder_items.num; ++i) {
+		struct media_file_data *item = &folder->folder_items.array[i];
+		const struct mps_folder_entry *entry = find_entry(scan, item->filename);
+		if (!entry)
+			return true;
+		bool ready = !wait || equal_stamp(entry, find_entry(previous, entry->name));
+		admitted_ready += ready;
+		if (!item->monitor_stamp)
+			set_stamp(item, entry);
+		else if (ready && !media_stamp_equal(item, entry))
+			return true;
+	}
+	for (size_t i = 0; scan->count > folder->folder_items.num && i < scan->count; ++i)
+		scanned_ready += !wait || equal_stamp(&scan->entries[i], find_entry(previous, scan->entries[i].name));
+	if (scanned_ready > admitted_ready)
+		return true;
+	int (*compare)(const void *, const void *) = sort_compare(sort);
+	for (size_t i = 1; compare && i < folder->folder_items.num; ++i)
+		if (compare(&folder->folder_items.array[i - 1], &folder->folder_items.array[i]) > 0)
+			return true;
+	return false;
+}
+
 void mps_folder_children_free(struct darray *children)
 {
 	DARRAY(struct media_file_data) items;
@@ -90,7 +134,7 @@ bool mps_folder_reconcile(struct media_file_data *folder, const struct mps_folde
 	DARRAY(struct media_file_data) result;
 	da_init(result);
 	*children = result.da;
-	if (!scan || !scan->success)
+	if (!scan || !scan->success || !effective_change(folder, scan, previous, sort, wait))
 		return false;
 	bool *used = scan->count ? bzalloc(scan->count * sizeof(bool)) : NULL;
 	bool modified = false;
@@ -128,15 +172,7 @@ bool mps_folder_reconcile(struct media_file_data *folder, const struct mps_folde
 		da_push_back(result, &item);
 	}
 	bfree(used);
-	int (*compare)(const void *, const void *) = NULL;
-	if (sort == MPS_FOLDER_AZ)
-		compare = by_name;
-	else if (sort == MPS_FOLDER_ZA)
-		compare = by_name_reverse;
-	else if (sort == MPS_FOLDER_OLDEST)
-		compare = by_date;
-	else if (sort == MPS_FOLDER_NEWEST)
-		compare = by_date_reverse;
+	int (*compare)(const void *, const void *) = sort_compare(sort);
 	if (compare && result.num > 1)
 		qsort(result.array, result.num, sizeof(*result.array), compare);
 	bool changed = modified || result.num != folder->folder_items.num;
