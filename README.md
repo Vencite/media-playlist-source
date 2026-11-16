@@ -23,13 +23,20 @@ The fork started as a production-focused fix for visible gaps between playlist i
 
 The original plugin was created by Ian Rodriguez / CodeYan01.
 
+## Latest additions (develop)
+
+- **Playlist timing:** remaining time for the current file and playlist pass, adjusted for playback speed. The Queue dock hides the playlist countdown while Loop is on.
+- **Playback controls:** Previous, Play/Pause, Stop and Next in Playlist Control, with an optional toolbar. Shuffle and Loop are available from both docks' right-click menus.
+- **Fresh shuffle:** preserve the existing cycle or start a fresh cycle when the source becomes active.
+- **Folder monitoring:** optional background refresh for added, removed and changed files, with filename/date sorting, a configurable interval and a file-stability check. Disabled by default.
+- **WebSocket integration:** read playlist state and entries, select items, and change Shuffle/Loop from external clients.
+
 ## Features
 
-- **NEW in 0.1.5:** **Playlist Queue** dock showing Previous, Now Playing and Up Next, including duration, playback progress and Program-scene status.
-- **NEW in 0.1.5:** **Playlist Control** dock for browsing the configured playlist and safely starting any selected file or folder item.
-- **NEW in 0.1.5:** Optional **Follow Program MPS** mode for both docks, available from their right-click menus.
+- **Playlist Queue** dock showing Previous, Now Playing and Up Next, including duration, playback progress and Program-scene status.
+- **Playlist Control** dock for browsing the configured playlist and safely starting any selected file or folder item.
+- Optional **Follow Program MPS** mode for both docks, available from their right-click menus.
 - Plays playlists of local files, folders, and URLs supported by FFmpeg.
-- Optional folder monitoring refreshes added, removed and changed files in the background, with filename/date sorting and a configurable check interval. Disabled by default.
 - Allows editing the playlist without restarting playback, including reordering items.
 - Allows editing source settings without restarting the current video.
 - Saves the currently playing file so it can be resumed when OBS restarts.
@@ -43,7 +50,7 @@ The original plugin was created by Ian Rodriguez / CodeYan01.
 - Can start with either the first file or the previously current file when the source is restarted.
 - Preloads the next local video and switches between internal A/B decoders to avoid the blank or transparent frame that can otherwise appear between consecutive files.
 - Routes decoder audio through the parent Media Playlist Source so its mixer gain, mute state, filters, and OBS track routing remain authoritative.
-- Both docks are available through OBS's Docks menu and support independent **Follow Program MPS** behavior from their right-click context menus.
+- Both docks are available through OBS's **Docks** menu.
 
 ## Installation
 
@@ -64,16 +71,18 @@ The current build configuration targets OBS Studio 31.1.1 and the fork is tested
 - Audio track and subtitle selection are not supported yet.
 - Folder monitoring uses stable size and modification time to delay files still being written; it cannot guarantee another application has finished writing.
 
-## For developers
+## WebSocket integration
 
-The development implementation of **authoritative playlist telemetry** exposes
-`GetPlaylistState` / `PlaylistStateChanged` through the optional obs-websocket
-Vendor API and adds **Playlist remaining** to Queue. See the
-[schema v1 contract](docs/playlist-telemetry.md) for request/event envelopes,
-strict unknown-value omission and known flags, speed units, current-pass
-semantics, limits, and build requirements. This work is not yet a claim of
-released-package or live-OBS verification; see the
-[remaining runtime/release checks](tests/playlist-telemetry.md).
+Use MPS data in tools such as Companion:
+
+- **Read:** current filename, playback state, elapsed time, file duration, playback speed, remaining file/playlist time, and playlist entries.
+- **Control:** select a playlist entry, set Shuffle/Loop, or use OBS's standard media actions for play, pause, stop, next, previous and seek.
+
+Enable **Tools → WebSocket Server Settings** in OBS and connect your client. In Companion, use an **OBS Studio** connection with **Custom – Send Vendor Request**, vendor `media-playlist-source`. For example, `GetPlaylistState` with `{"source_name":"My Playlist"}` reads that source's state.
+
+Other obs-websocket v5 clients use `CallVendorRequest`. See the [API reference](docs/playlist-telemetry.md) for requests, live events and handling unknown times. API playlist time describes the current pass, including when Loop is enabled.
+
+## For developers
 
 To inspect the keys stored in the source [settings](https://docs.obsproject.com/reference-sources#c.obs_source_get_settings), use [obs_data_get_json](https://docs.obsproject.com/reference-settings#c.obs_data_get_json) or inspect the scene collection JSON. The implementation is in [`src/media-playlist-source.c`](src/media-playlist-source.c).
 
@@ -98,10 +107,6 @@ If the item at `media_index` is not a folder, `folder_item_index` is ignored. Ou
 
 Development of this fork uses AI-assisted coding tools where useful, but changes are reviewed, compiled in CI, and validated in OBS before being relied on in production.
 
-Linux CI runs CTest. Vendor wire-contract tests use obs-websocket's real JSON
-converter and need the **test-only** `nlohmann-json3-dev` package on Ubuntu;
-there is no new plugin runtime dependency. Use `-DBUILD_TESTING=OFF` for a build
-without test dependencies. Duration discovery's explicit runtime benchmark is
-`duration-probe-benchmark`; see the telemetry docs before running it.
+Linux CI runs CTest; Windows CI also runs native folder tests. Vendor wire-contract tests use obs-websocket's JSON converter and require the **test-only** `nlohmann-json3-dev` package on Ubuntu. Use `-DBUILD_TESTING=OFF` to omit tests. The opt-in duration-probing benchmark target is `duration-probe-benchmark`.
 
 Release validation notes are kept in [docs/release-notes](docs/release-notes), and the manual regression checklist is available in [tests/manual-regression.md](tests/manual-regression.md).
