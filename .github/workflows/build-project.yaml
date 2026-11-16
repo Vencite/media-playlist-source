@@ -79,7 +79,7 @@ jobs:
 
   macos-build:
     name: Build for macOS 🍏
-    runs-on: macos-15
+    runs-on: macos-15-intel
     needs: check-event
     defaults:
       run:
@@ -147,6 +147,12 @@ jobs:
           config: ${{ needs.check-event.outputs.config }}
           codesign: ${{ fromJSON(needs.check-event.outputs.codesign) }}
           codesignIdent: ${{ steps.codesign.outputs.codesignIdent }}
+
+      - name: Verify Universal Binary
+        run: |
+          local plugin_binary="release/${{ needs.check-event.outputs.config }}/${{ steps.setup.outputs.pluginName }}.plugin/Contents/MacOS/${{ steps.setup.outputs.pluginName }}"
+          xcrun lipo "${plugin_binary}" -verify_arch arm64 x86_64
+          xcrun lipo -archs "${plugin_binary}"
 
       - name: Package Plugin 📀
         uses: ./.github/actions/package-plugin
