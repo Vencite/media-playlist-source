@@ -951,6 +951,32 @@ static void test_wrapped_audio_packet_has_contiguous_samples(void)
 	bfree(mps.audio_scratch);
 }
 
+static void test_deactivation_discards_decoder_end_before_queued_stop(void)
+{
+	for (int mode = 0; mode < 2; ++mode) {
+		obs_source_t *source = create_playlist(2, SHUFFLE_RESET_PRESERVE);
+		struct media_playlist_source *mps = obs_obj_get_data(source);
+		mps->visibility_behavior = mode ? VISIBILITY_BEHAVIOR_STOP_PLAY_NEXT : VISIBILITY_BEHAVIOR_STOP_RESTART;
+		mps->source_active = true;
+		mps->active_slot = &mps->media_slots[0];
+		mps->standby_slot = &mps->media_slots[1];
+		mps->active_slot->ended = true;
+		mps->active_slot->audio_enabled = true;
+		struct media_file_data *selected = mps->actual_media;
+
+		/* The main-view ref is already gone, before OBS calls deactivate. */
+		process_slot_events(mps);
+		assert(!mps->automatic_next_pending);
+		mps->active_slot->ended_handled = false;
+		mps_deactivate(mps);
+		process_slot_events(mps);
+		assert(mps->active_slot->expected_stop && !mps->active_slot->audio_enabled);
+		assert(!mps->active_slot->ended && !mps->automatic_next_pending);
+		assert(mps->actual_media == selected);
+		obs_source_release(source);
+	}
+}
+
 int main(void)
 {
 	assert(obs_startup("en-US", NULL, NULL));
@@ -959,6 +985,7 @@ int main(void)
 	test_restart_and_resume_after_cancelled_bootstrap();
 	test_rejected_active_child_is_not_committed();
 	test_wrapped_audio_packet_has_contiguous_samples();
+	test_deactivation_discards_decoder_end_before_queued_stop();
 	test_previous_after_removing_later_current_folder_item();
 	test_previous_after_removing_first_current_folder_item();
 	test_folder_recovery_preserves_current_in_later_folder();

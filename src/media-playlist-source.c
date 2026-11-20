@@ -1717,6 +1717,8 @@ static void media_source_started(void *data, calldata_t *cd)
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	if (slot->source && slot->source_generation == context->source_generation) {
 		slot->started = true;
+		slot->ended = false;
+		slot->ended_handled = false;
 		if (slot == mps->active_slot) {
 			pthread_mutex_lock(&mps->audio_mutex);
 			clear_audio_queues_locked(mps);
@@ -2033,6 +2035,7 @@ static void mps_stop(void *data)
 	pthread_mutex_lock(&mps->audio_mutex);
 	if (mps->active_slot) {
 		mps->active_slot->expected_stop = true;
+		mps->active_slot->ended = false;
 		mps->active_slot->audio_enabled = false;
 	}
 	clear_audio_queues_locked(mps);
@@ -2342,6 +2345,11 @@ static void mps_activate(void *data)
 	}
 }
 
+static bool stops_on_deactivation(enum visibility_behavior behavior)
+{
+	return behavior == VISIBILITY_BEHAVIOR_STOP_RESTART || behavior == VISIBILITY_BEHAVIOR_STOP_PLAY_NEXT;
+}
+
 static void mps_deactivate(void *data)
 {
 	struct media_playlist_source *mps = data;
@@ -2349,6 +2357,13 @@ static void mps_deactivate(void *data)
 	pthread_mutex_lock(&mps->lifecycle_mutex);
 	mps->source_active = false;
 	mps->fresh_shuffle_pending = false;
+	if (mps->active_slot && stops_on_deactivation(mps->visibility_behavior)) {
+		/* OBS may deactivate the FFmpeg child before ticking its parent.
+		 * Discard that end before handling automatic playlist advancement. */
+		mps->active_slot->expected_stop = true;
+		mps->active_slot->ended = false;
+		mps->active_slot->audio_enabled = false;
+	}
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
 
 	if (mps->visibility_behavior == VISIBILITY_BEHAVIOR_STOP_RESTART) {
@@ -3027,7 +3042,9 @@ static void process_slot_events(struct media_playlist_source *mps)
 	standby = mps->standby_slot;
 	if (active && active->ended && !active->ended_handled) {
 		active->ended_handled = true;
-		active_ended = true;
+		const bool leaving_program = mps->source_active && !obs_source_active(mps->source) &&
+					     stops_on_deactivation(mps->visibility_behavior);
+		active_ended = !active->expected_stop && !leaving_program;
 		active_produced = active->produced_output;
 	}
 	if (standby && standby->failed)
