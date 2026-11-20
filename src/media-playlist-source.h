@@ -187,6 +187,9 @@ struct media_playlist_source {
 	struct deque audio_data[MAX_AUDIO_CHANNELS];
 	struct deque audio_frames;
 	struct deque audio_timestamps;
+	struct mps_audio_clock audio_clock;
+	uint8_t *audio_scratch;
+	size_t audio_scratch_size;
 	size_t num_channels;
 	pthread_mutex_t audio_mutex;
 };

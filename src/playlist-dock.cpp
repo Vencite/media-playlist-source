@@ -99,7 +99,7 @@ constexpr int kStableIdRole = Qt::UserRole + 2;
 constexpr int kPathRole = Qt::UserRole + 3;
 constexpr const char *source_events[] = {"source_create", "source_remove", "source_destroy", "source_rename"};
 constexpr const char *scene_events[] = {"item_add", "item_remove", "item_visible"};
-constexpr const char *transition_events[] = {"transition_start", "transition_stop"};
+constexpr const char *transition_events[] = {"transition_start", "transition_video_stop", "transition_stop"};
 
 QString filename_from_entry(const struct mps_playlist_item_snapshot &entry)
 {

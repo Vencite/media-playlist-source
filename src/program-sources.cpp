@@ -60,14 +60,22 @@ MpsProgramSources mps_program_sources(obs_source_t *output)
 	if (!output)
 		return {};
 	if (obs_source_get_type(output) == OBS_SOURCE_TYPE_TRANSITION) {
-		/* OBS promotes B to A when both video and audio finish. Read B first
-		 * so completion between the reads cannot drop the incoming scene. */
-		OBSSourceAutoRelease incoming = obs_transition_get_source(output, OBS_TRANSITION_SOURCE_B);
-		OBSSourceAutoRelease outgoing = obs_transition_get_source(output, OBS_TRANSITION_SOURCE_A);
-		if (outgoing)
-			visit_scene(obs_scene_from_source(outgoing), traversal, 0);
-		if (incoming)
-			visit_scene(obs_scene_from_source(incoming), traversal, 0);
+		if (obs_transition_get_time(output) >= 1.0f) {
+			/* OBS can keep A in the audio graph after the picture reaches B.
+			 * Follow the scene visible on Program without waiting for audio. */
+			OBSSourceAutoRelease active = obs_transition_get_active_source(output);
+			if (active)
+				visit_scene(obs_scene_from_source(active), traversal, 0);
+		} else {
+			/* OBS promotes B to A when both streams finish. Read B first so
+			 * completion between reads cannot lose the incoming scene. */
+			OBSSourceAutoRelease incoming = obs_transition_get_source(output, OBS_TRANSITION_SOURCE_B);
+			OBSSourceAutoRelease outgoing = obs_transition_get_source(output, OBS_TRANSITION_SOURCE_A);
+			if (outgoing)
+				visit_scene(obs_scene_from_source(outgoing), traversal, 0);
+			if (incoming)
+				visit_scene(obs_scene_from_source(incoming), traversal, 0);
+		}
 	} else {
 		visit_scene(obs_scene_from_source(output), traversal, 0);
 	}

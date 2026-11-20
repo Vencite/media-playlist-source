@@ -87,3 +87,24 @@ bool mps_coordinator_complete(struct mps_playback_coordinator *coordinator, uint
 	coordinator->failed_candidates = 0;
 	return true;
 }
+
+uint64_t mps_audio_clock_timestamp(struct mps_audio_clock *clock, uint64_t decoder_ns, uint64_t capture_ns)
+{
+	/* Keep decoder spacing through delivery jitter. A seek or restart can
+	 * move the decoder clock by much more than the time since capture. */
+	const uint64_t max_skew_ns = 100000000;
+	if (clock->initialized && decoder_ns >= clock->last_decoder_ns) {
+		const uint64_t elapsed_ns = decoder_ns - clock->decoder_origin_ns;
+		if (elapsed_ns <= UINT64_MAX - clock->capture_origin_ns) {
+			const uint64_t mapped_ns = clock->capture_origin_ns + elapsed_ns;
+			const uint64_t skew_ns = mapped_ns > capture_ns ? mapped_ns - capture_ns
+									: capture_ns - mapped_ns;
+			if (skew_ns <= max_skew_ns) {
+				clock->last_decoder_ns = decoder_ns;
+				return mapped_ns;
+			}
+		}
+	}
+	*clock = (struct mps_audio_clock){decoder_ns, capture_ns, decoder_ns, true};
+	return capture_ns;
+}

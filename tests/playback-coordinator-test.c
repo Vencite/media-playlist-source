@@ -155,6 +155,19 @@ static void test_active_child_enumeration_policy(void)
 	CHECK(!mps_source_is_active_child(false, false));
 }
 
+static void test_decoder_audio_clock_uses_capture_epoch(void)
+{
+	struct mps_audio_clock clock = {0};
+	const uint64_t now = 8000000000000;
+	CHECK(mps_audio_clock_timestamp(&clock, 600000000, now) == now);
+	CHECK(mps_audio_clock_timestamp(&clock, 620000000, now + 25000000) == now + 20000000);
+	CHECK(mps_audio_clock_timestamp(&clock, 1500000000, now + 40000000) == now + 40000000);
+	CHECK(mps_audio_clock_timestamp(&clock, 1520000000, now + 65000000) == now + 60000000);
+	CHECK(mps_audio_clock_timestamp(&clock, 100000000, now + 90000000) == now + 90000000);
+	clock = (struct mps_audio_clock){0};
+	CHECK(mps_audio_clock_timestamp(&clock, 5000000000, now + 110000000) == now + 110000000);
+}
+
 int main(void)
 {
 	test_latest_rapid_request_wins();
@@ -166,6 +179,7 @@ int main(void)
 	test_cancel_invalidates_in_flight_generation();
 	test_restart_preserves_bootstrap_without_active_source();
 	test_active_child_enumeration_policy();
+	test_decoder_audio_clock_uses_capture_epoch();
 	puts("playback coordinator tests passed");
 	return 0;
 }

@@ -185,6 +185,19 @@ and the private Program copy can have different mixer visibility. The Preview
 row can remain labelled **Preview** while Program audio records correctly. Use
 the recording and the playback time in the docks to check the Program copy.
 
+### Rapid switching and audio buffering (0.2.2)
+
+On OBS 33, confirm Plugin Manager displays **0.2.2** after installing and
+restarting OBS. In Polish, the Studio Mode options are **Duplikuj scenę** and
+**Duplikuj źródła**. Repeat the matrix above with the same monitoring setting as
+the production collection. Alternate between two MPS scenes with Cut and Fade,
+then repeat with rapid Restart and Next commands between cuts. The docks should
+select the visible Program source once the video transition ends. In the Program
+recording, check for dropouts and A/V sync after the switch. Inspect the OBS log
+for MPS warnings about reaching the maximum audio buffer or restarting source
+audio. Test the local speaker monitoring separately. A private source copy can
+output audio to Program while it has monitoring disabled in OBS.
+
 ## Final playlist dock polish checks
 
 A. Enable Queue Follow on MPS A, then manually choose MPS B. Confirm Queue

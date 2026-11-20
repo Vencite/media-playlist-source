@@ -926,6 +926,31 @@ static void test_rejected_active_child_is_not_committed(void)
 	obs_source_release(source);
 }
 
+static void test_wrapped_audio_packet_has_contiguous_samples(void)
+{
+	struct media_playlist_source mps = {.num_channels = 1};
+	const float first[] = {1.0f, 2.0f, 3.0f};
+	const float last[] = {4.0f, 5.0f};
+	deque_reserve(&mps.audio_data[0], 4 * sizeof(float));
+	deque_push_back(&mps.audio_data[0], first, sizeof(first));
+	deque_pop_front(&mps.audio_data[0], NULL, sizeof(last));
+	deque_push_back(&mps.audio_data[0], last, sizeof(last));
+	uint32_t frames = 3;
+	uint64_t timestamp = 123;
+	deque_push_back(&mps.audio_frames, &frames, sizeof(frames));
+	deque_push_back(&mps.audio_timestamps, &timestamp, sizeof(timestamp));
+
+	struct obs_source_audio packet = {0};
+	pop_audio_packet_locked(&mps, &packet);
+	const float *samples = (const float *)packet.data[0];
+	assert(packet.frames == frames && packet.timestamp == timestamp);
+	assert(samples[0] == 3.0f && samples[1] == 4.0f && samples[2] == 5.0f);
+	assert(!mps.audio_frames.size && !mps.audio_timestamps.size && !mps.audio_data[0].size);
+
+	clear_audio_queues_locked(&mps);
+	bfree(mps.audio_scratch);
+}
+
 int main(void)
 {
 	assert(obs_startup("en-US", NULL, NULL));
@@ -933,6 +958,7 @@ int main(void)
 	obs_register_source(&folder_fake_decoder);
 	test_restart_and_resume_after_cancelled_bootstrap();
 	test_rejected_active_child_is_not_committed();
+	test_wrapped_audio_packet_has_contiguous_samples();
 	test_previous_after_removing_later_current_folder_item();
 	test_previous_after_removing_first_current_folder_item();
 	test_folder_recovery_preserves_current_in_later_folder();

@@ -985,6 +985,25 @@ static void clear_audio_queues_locked(struct media_playlist_source *mps)
 		deque_free(&mps->audio_data[i]);
 	deque_free(&mps->audio_frames);
 	deque_free(&mps->audio_timestamps);
+	mps->audio_clock = (struct mps_audio_clock){0};
+}
+
+static void pop_audio_packet_locked(struct media_playlist_source *mps, struct obs_source_audio *audio)
+{
+	deque_pop_front(&mps->audio_frames, &audio->frames, sizeof(audio->frames));
+	deque_pop_front(&mps->audio_timestamps, &audio->timestamp, sizeof(audio->timestamp));
+	const size_t plane_bytes = (size_t)audio->frames * sizeof(float);
+	const size_t packet_bytes = mps->num_channels * plane_bytes;
+	if (packet_bytes > mps->audio_scratch_size) {
+		mps->audio_scratch = brealloc(mps->audio_scratch, packet_bytes);
+		mps->audio_scratch_size = packet_bytes;
+	}
+	for (size_t i = 0; i < mps->num_channels; i++) {
+		/* A frame can straddle the end of the deque's circular storage. */
+		uint8_t *plane = mps->audio_scratch + i * plane_bytes;
+		deque_pop_front(&mps->audio_data[i], plane, plane_bytes);
+		audio->data[i] = plane;
+	}
 }
 
 static void mute_active_audio(struct media_playlist_source *mps)
@@ -1696,14 +1715,22 @@ static void media_source_started(void *data, calldata_t *cd)
 	struct media_playlist_source *mps = slot->owner;
 
 	pthread_mutex_lock(&mps->lifecycle_mutex);
-	if (slot->source && slot->source_generation == context->source_generation)
+	if (slot->source && slot->source_generation == context->source_generation) {
 		slot->started = true;
+		if (slot == mps->active_slot) {
+			pthread_mutex_lock(&mps->audio_mutex);
+			clear_audio_queues_locked(mps);
+			pthread_mutex_unlock(&mps->audio_mutex);
+		}
+	}
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
 }
 
 void mps_audio_callback(void *data, obs_source_t *source, const struct audio_data *audio_data, bool muted)
 {
 	UNUSED_PARAMETER(muted);
+	if (!audio_data->frames)
+		return;
 	struct media_source_callback_context *context = data;
 	struct media_source_slot *slot = context->slot;
 	struct media_playlist_source *mps = slot->owner;
@@ -1717,12 +1744,17 @@ void mps_audio_callback(void *data, obs_source_t *source, const struct audio_dat
 	pthread_mutex_lock(&mps->audio_mutex);
 	slot->produced_output = true;
 	pthread_mutex_unlock(&mps->lifecycle_mutex);
-	size_t size = audio_data->frames * sizeof(float);
+	if (!mps->num_channels)
+		mps->num_channels = audio_output_get_channels(obs_get_audio());
+	size_t size = (size_t)audio_data->frames * sizeof(float);
 	for (size_t i = 0; i < mps->num_channels; i++) {
 		deque_push_back(&mps->audio_data[i], audio_data->data[i], size);
 	}
+	/* The private decoder emits its own timestamp epoch. Feed OBS a
+	 * monotonic timestamp when re-emitting the packet from the parent. */
+	const uint64_t timestamp = mps_audio_clock_timestamp(&mps->audio_clock, audio_data->timestamp, os_gettime_ns());
 	deque_push_back(&mps->audio_frames, &audio_data->frames, sizeof(audio_data->frames));
-	deque_push_back(&mps->audio_timestamps, &audio_data->timestamp, sizeof(audio_data->timestamp));
+	deque_push_back(&mps->audio_timestamps, &timestamp, sizeof(timestamp));
 	pthread_mutex_unlock(&mps->audio_mutex);
 }
 
@@ -2367,6 +2399,7 @@ static void mps_destroy(void *data)
 	bfree(mps->activation_first_id);
 	bfree(mps->activation_first_filename);
 	bfree(mps->source_uuid);
+	bfree(mps->audio_scratch);
 	pthread_mutex_destroy(&mps->telemetry_mutex);
 	pthread_mutex_destroy(&mps->mutex);
 	pthread_mutex_destroy(&mps->audio_mutex);
@@ -3114,19 +3147,13 @@ static void mps_video_tick(void *data, float seconds)
 	const struct audio_output_info *aoi = audio_output_get_info(a);
 	pthread_mutex_lock(&mps->audio_mutex);
 	while (mps->audio_frames.size > 0) {
-		struct obs_source_audio audio;
-		audio.format = aoi->format;
-		audio.samples_per_sec = aoi->samples_per_sec;
-		audio.speakers = aoi->speakers;
-		deque_pop_front(&mps->audio_frames, &audio.frames, sizeof(audio.frames));
-		deque_pop_front(&mps->audio_timestamps, &audio.timestamp, sizeof(audio.timestamp));
-		for (size_t i = 0; i < mps->num_channels; i++) {
-			audio.data[i] = (uint8_t *)mps->audio_data[i].data + mps->audio_data[i].start_pos;
-		}
+		struct obs_source_audio audio = {
+			.format = aoi->format,
+			.samples_per_sec = aoi->samples_per_sec,
+			.speakers = aoi->speakers,
+		};
+		pop_audio_packet_locked(mps, &audio);
 		obs_source_output_audio(mps->source, &audio);
-		for (size_t i = 0; i < mps->num_channels; i++) {
-			deque_pop_front(&mps->audio_data[i], NULL, audio.frames * sizeof(float));
-		}
 	}
 	mps->num_channels = audio_output_get_channels(a);
 	pthread_mutex_unlock(&mps->audio_mutex);

@@ -26,6 +26,13 @@ struct mps_playback_coordinator {
 	bool preparing;
 };
 
+struct mps_audio_clock {
+	uint64_t decoder_origin_ns;
+	uint64_t capture_origin_ns;
+	uint64_t last_decoder_ns;
+	bool initialized;
+};
+
 void mps_coordinator_init(struct mps_playback_coordinator *coordinator);
 uint64_t mps_coordinator_request(struct mps_playback_coordinator *coordinator, enum mps_switch_request request,
 				 size_t candidate_limit, bool preserve_failures);
@@ -37,3 +44,4 @@ bool mps_coordinator_cancel_for_restart(struct mps_playback_coordinator *coordin
 bool mps_source_is_active_child(bool active_slot, bool child_added);
 enum mps_switch_failure mps_coordinator_fail(struct mps_playback_coordinator *coordinator, uint64_t generation);
 bool mps_coordinator_complete(struct mps_playback_coordinator *coordinator, uint64_t generation);
+uint64_t mps_audio_clock_timestamp(struct mps_audio_clock *clock, uint64_t decoder_ns, uint64_t capture_ns);
