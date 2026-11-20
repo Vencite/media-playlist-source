@@ -72,7 +72,9 @@ function Package {
 
     Log-Group "Archiving Portable ${ProductName}..."
     tree /F "${ProjectRoot}/release/${Configuration}/${ProductName}"
-    Copy-Item -Path "${ProjectRoot}/release/${Configuration}/${ProductName}/data/locale" -Destination "${ProjectRoot}/release-portable/${Configuration}/data/obs-plugins/${ProductName}/locale" -Recurse
+    $PortableData = "${ProjectRoot}/release-portable/${Configuration}/data/obs-plugins/${ProductName}"
+    New-Item -ItemType Directory -Path $PortableData -Force | Out-Null
+    Copy-Item -Path "${ProjectRoot}/release/${Configuration}/${ProductName}/data/*" -Destination $PortableData -Recurse
     Copy-Item -Path "${ProjectRoot}/release/${Configuration}/${ProductName}/bin" -Destination "${ProjectRoot}/release-portable/${Configuration}/obs-plugins" -Recurse
     tree /F "${ProjectRoot}/release-portable/${Configuration}"
 

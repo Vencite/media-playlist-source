@@ -76,6 +76,8 @@ if(ENABLE_FRONTEND_API AND ENABLE_QT)
 endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+configure_file(cmake/common/module-manifest.json.in "${CMAKE_CURRENT_BINARY_DIR}/manifest.json" @ONLY)
+target_add_resource(${CMAKE_PROJECT_NAME} "${CMAKE_CURRENT_BINARY_DIR}/manifest.json")
 
 if(BUILD_TESTING)
   add_executable(program-sources-test tests/program-sources-test.cpp src/program-sources.cpp)

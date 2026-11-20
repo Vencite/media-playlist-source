@@ -1,0 +1,10 @@
+{
+  "id": "@MACOS_BUNDLEID@",
+  "name": "@CMAKE_PROJECT_NAME@",
+  "display_name": "@_display_name@",
+  "version": "@CMAKE_PROJECT_VERSION@",
+  "description": "Play and control media playlists in OBS Studio.",
+  "urls": {
+    "repository": "@PLUGIN_WEBSITE@"
+  }
+}
