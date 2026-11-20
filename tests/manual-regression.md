@@ -91,13 +91,11 @@ between the docks is observed.
 4. Switch Program to a scene with no visible MPS. Confirm the status reads
    **No active MPS** and the previous/manual source selection is retained.
 5. Put two visible MPS sources in Program. Confirm the status reads
-   **2 active MPS**, an already active selected MPS remains selected, and a
-   non-active selected source is not replaced by an arbitrary candidate.
-   Queue retains the selection but clears timing while Follow has no unique
-   Program target; it must not display a stale playlist remaining value.
-6. Manually select one of multiple active MPS sources while Follow remains on,
-   then switch to a Program scene containing exactly one MPS. Confirm the manual
-   choice is accepted first and the later unambiguous scene is followed.
+   **2 active MPS**. Both following docks retain the manual selection in the
+   selector, clear their contents, and disable playback and Shuffle/Loop.
+6. Select a source manually. Confirm this exits Follow for that dock and its
+   controls work on the selected source. Re-enable Follow and transition to a
+   Program scene containing exactly one MPS. Both following docks select it.
 7. Repeat with an MPS inside a nested scene, a group, and nested combinations.
    Hide each ancestor item in turn and confirm the contained MPS is excluded.
 8. Reference the same MPS more than once in Program and confirm it is counted
@@ -127,6 +125,65 @@ between the docks is observed.
 14. Repeat the dock layout checks under available OBS light and dark themes.
     Confirm native palette text, separators, progress bar, tree selection, and
     play icon remain legible without fixed theme colors.
+
+## Studio Mode and Duplicate Scene on macOS (0.2.1)
+
+Run against the 0.2.1 Universal build in OBS Studio 33.0.1 on Apple Silicon.
+For comparison, repeat the Edit Properties-on case with 0.2.0. Record the OBS
+version, plugin version, pass/fail status and any OBS log or recording for each
+configuration. `program-sources` covers libobs graph selection and UUID lifetime.
+`shuffle-activation` covers bootstrap and decoder attachment failures. Neither
+automated test renders video, records audio, or exercises the dock widgets.
+
+Set up two scenes, A and B, each with its own MPS and at least three short local
+clips with distinct filenames, visuals and audible tones. Add an empty scene C.
+Enable **Follow Program MPS** in both docks. Start with **Stop/Restart** and the
+**Restart Current File** option. Set OBS to record Program locally.
+
+| Studio Mode | Duplicate Scene | Edit Properties | Expected playback identity |
+| --- | --- | --- | --- |
+| Off | N/A | N/A | The source in the scene on the output |
+| On | Off | N/A | The source in the public Program scene |
+| On | On | Off | The shared source in the private Program scene's item snapshot |
+| On | On | On | The private Program source when OBS duplicates the MPS item |
+
+For every row:
+
+1. Put A on Program and play. Confirm that the recording has A's picture and
+   audio and that both docks show A, its **Now Playing**, **Up Next**, advancing
+   time and the correct Play/Pause state. If Studio Mode is on, select B in
+   Preview and verify Program and both docks still show A. With duplication on,
+   also hide/remove the corresponding Preview item and verify the Program scene
+   snapshot is retained until the next transition.
+2. Use **Cut** to B, then a two-second **Fade** back to A. Confirm that the
+   docks control B after Cut and A after Fade. While Fade has two distinct
+   visible MPS instances, both docks should show **2 active MPS** and suspend
+   Follow-mode controls. If both sides reference one instance, count it once.
+3. On the active Program source, exercise Next, Previous, Play Selected, Pause,
+   Play, Stop, then Play again to restart. Verify the filename, order and clock
+   against Program. With Edit Properties on, Go/Stop in Program should affect
+   the selected private copy when Preview has an independent instance.
+4. Let two local clips play through their A/B handoff. Check for blank frames,
+   dropped or doubled audio, a stale timestamp, and a missing **Up Next**.
+   Repeat with shuffle enabled and then with loop enabled. During a conflicting
+   clock read the time may briefly be unavailable; the next successful read
+   must recover and the dock must never show timing from the previous source.
+5. Switch rapidly between scenes; transition to C, return to A, exit and re-enter
+   Studio Mode, and toggle Duplicate Scene and Edit Properties while settled on
+   A. Verify each dock updates without another scene change. Remove an MPS and
+   a scene, switch scene collections, and verify no stale controls, crashes,
+   or playback commands to the old collection. Repeat with groups, nested
+   scenes, hidden ancestors and more than one reference to a single source.
+6. With different gain/mute settings on A and B, review the Program recording
+   for one audio path per intended source. An overlap of different clips during
+   Fade is expected. Repeat the activation cycle with Pause/Unpause, Always Play,
+   and Stop/Play Next. For Stop/Restart, stop immediately after activation and
+   restart before the first decoder commits to verify bootstrap recovery.
+
+OBS owns the mixer category. With Edit Properties on, the public Preview source
+and the private Program copy can have different mixer visibility. The Preview
+row can remain labelled **Preview** while Program audio records correctly. Use
+the recording and the playback time in the docks to check the Program copy.
 
 ## Final playlist dock polish checks
 

@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
+#include <utility>
 
 #include <QAbstractItemView>
 #include <QAction>
@@ -37,6 +37,7 @@
 
 #include "playlist-dock.h"
 #include "playlist-telemetry.h"
+#include "program-sources.hpp"
 
 static QString filename_from_path(const QString &path)
 {
@@ -89,7 +90,6 @@ private:
 
 namespace {
 
-constexpr const char *kSourceId = "media_playlist_source_codeyan";
 constexpr const char *kQueueDockId = "media-playlist-queue-dock";
 constexpr const char *kControlDockId = "media-playlist-control-dock";
 constexpr int kTimerIntervalMs = 250;
@@ -97,12 +97,9 @@ constexpr int kMediaIndexRole = Qt::UserRole;
 constexpr int kFolderItemIndexRole = Qt::UserRole + 1;
 constexpr int kStableIdRole = Qt::UserRole + 2;
 constexpr int kPathRole = Qt::UserRole + 3;
-constexpr std::size_t kMaxProgramSceneDepth = 64;
-
-struct SourceInfo {
-	QString uuid;
-	QString name;
-};
+constexpr const char *source_events[] = {"source_create", "source_remove", "source_destroy", "source_rename"};
+constexpr const char *scene_events[] = {"item_add", "item_remove", "item_visible"};
+constexpr const char *transition_events[] = {"transition_start", "transition_stop"};
 
 QString filename_from_entry(const struct mps_playlist_item_snapshot &entry)
 {
@@ -111,154 +108,21 @@ QString filename_from_entry(const struct mps_playlist_item_snapshot &entry)
 	return filename_from_path(QString::fromUtf8(entry.path ? entry.path : ""));
 }
 
-bool enum_mps_source(void *data, obs_source_t *source)
+OBSSourceAutoRelease dock_source(const QString &uuid)
 {
-	const char *id = obs_source_get_unversioned_id(source);
-	if (!id || std::strcmp(id, kSourceId) != 0)
-		return true;
-
-	const char *uuid = obs_source_get_uuid(source);
-	if (!uuid || !*uuid)
-		return true;
-
-	auto *sources = static_cast<QVector<SourceInfo> *>(data);
-	const char *name = obs_source_get_name(source);
-	sources->append({QString::fromUtf8(uuid), QString::fromUtf8(name ? name : "")});
-	return true;
+	if (uuid.isEmpty())
+		return nullptr;
+	OBSSourceAutoRelease source = obs_get_source_by_uuid(uuid.toUtf8().constData());
+	if (!mps_is_playlist_source(source) || obs_source_removed(source))
+		return nullptr;
+	return source;
 }
 
-QVector<SourceInfo> enumerate_mps_sources()
+OBSSourceAutoRelease command_source(const PlaylistProgramTracker &program, bool follow, const QString &uuid)
 {
-	QVector<SourceInfo> sources;
-	obs_enum_sources(enum_mps_source, &sources);
-	return sources;
-}
-
-struct ProgramSourceTraversal {
-	QSet<QString> source_uuids;
-	QSet<QString> scene_uuids;
-	QSet<const obs_source_t *> visited_scenes;
-};
-
-struct ProgramSceneEnumeration {
-	ProgramSourceTraversal *traversal;
-	std::size_t depth;
-};
-
-void enumerate_program_scene(obs_scene_t *scene, ProgramSourceTraversal *traversal, std::size_t depth);
-
-bool enum_program_scene_item(obs_scene_t *, obs_sceneitem_t *item, void *data)
-{
-	auto *enumeration = static_cast<ProgramSceneEnumeration *>(data);
-	if (!obs_sceneitem_visible(item))
-		return true;
-
-	obs_source_t *source = obs_sceneitem_get_source(item);
-	if (!source)
-		return true;
-	const char *id = obs_source_get_unversioned_id(source);
-	if (id && std::strcmp(id, kSourceId) == 0) {
-		const char *uuid = obs_source_get_uuid(source);
-		if (uuid && *uuid)
-			enumeration->traversal->source_uuids.insert(QString::fromUtf8(uuid));
-	}
-
-	obs_scene_t *nested_scene = obs_sceneitem_is_group(item) ? obs_sceneitem_group_get_scene(item)
-								 : obs_scene_from_source(source);
-	if (nested_scene)
-		enumerate_program_scene(nested_scene, enumeration->traversal, enumeration->depth + 1);
-	return true;
-}
-
-void enumerate_program_scene(obs_scene_t *scene, ProgramSourceTraversal *traversal, std::size_t depth)
-{
-	if (!scene || !traversal || depth > kMaxProgramSceneDepth)
-		return;
-	obs_source_t *scene_source = obs_scene_get_source(scene);
-	if (!scene_source || traversal->visited_scenes.contains(scene_source))
-		return;
-	traversal->visited_scenes.insert(scene_source);
-	const char *scene_uuid = obs_source_get_uuid(scene_source);
-	if (scene_uuid && *scene_uuid)
-		traversal->scene_uuids.insert(QString::fromUtf8(scene_uuid));
-	ProgramSceneEnumeration enumeration = {traversal, depth};
-	obs_scene_enum_items(scene, enum_program_scene_item, &enumeration);
-}
-
-ProgramSourceTraversal enumerate_program_sources()
-{
-	ProgramSourceTraversal traversal;
-	obs_source_t *program_source = obs_frontend_get_current_scene();
-	if (!program_source)
-		return traversal;
-
-	obs_scene_t *program_scene = obs_scene_from_source(program_source);
-	if (program_scene)
-		enumerate_program_scene(program_scene, &traversal, 0);
-	obs_source_release(program_source);
-	return traversal;
-}
-
-void set_program_scene_event_connections(QSet<QString> &connected, const QSet<QString> &desired,
-					 signal_callback_t callback, void *data)
-{
-	static const char *event_names[] = {"item_add", "item_remove", "item_visible"};
-	for (const QString &uuid : connected - desired) {
-		const QByteArray utf8 = uuid.toUtf8();
-		obs_source_t *source = obs_get_source_by_uuid(utf8.constData());
-		if (!source)
-			continue;
-		signal_handler_t *handler = obs_source_get_signal_handler(source);
-		for (const char *event_name : event_names)
-			signal_handler_disconnect(handler, event_name, callback, data);
-		obs_source_release(source);
-	}
-	for (const QString &uuid : desired - connected) {
-		const QByteArray utf8 = uuid.toUtf8();
-		obs_source_t *source = obs_get_source_by_uuid(utf8.constData());
-		if (!source)
-			continue;
-		signal_handler_t *handler = obs_source_get_signal_handler(source);
-		for (const char *event_name : event_names)
-			signal_handler_connect(handler, event_name, callback, data);
-		obs_source_release(source);
-	}
-	connected = desired;
-}
-
-void connect_obs_events(signal_callback_t callback, void *data)
-{
-	signal_handler_t *handler = obs_get_signal_handler();
-	if (!handler)
-		return;
-	signal_handler_connect(handler, "source_create", callback, data);
-	signal_handler_connect(handler, "source_remove", callback, data);
-	signal_handler_connect(handler, "source_destroy", callback, data);
-	signal_handler_connect(handler, "source_rename", callback, data);
-}
-
-void disconnect_obs_events(signal_callback_t callback, void *data)
-{
-	signal_handler_t *handler = obs_get_signal_handler();
-	if (!handler)
-		return;
-	signal_handler_disconnect(handler, "source_create", callback, data);
-	signal_handler_disconnect(handler, "source_remove", callback, data);
-	signal_handler_disconnect(handler, "source_destroy", callback, data);
-	signal_handler_disconnect(handler, "source_rename", callback, data);
-}
-
-bool needs_source_refresh(enum obs_frontend_event event)
-{
-	switch (event) {
-	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
-	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
-	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP:
-	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
-		return true;
-	default:
-		return false;
-	}
+	if (follow && !program.is_current_program_source(uuid))
+		return nullptr;
+	return dock_source(uuid);
 }
 
 QString follow_status_text(std::size_t active_source_count)
@@ -278,34 +142,24 @@ void configure_follow_context_menu(QWidget *dock, QWidget *source_header, QActio
 	source_header->addAction(action);
 }
 
-void set_playback_option(const QString &source_uuid, const char *key, bool enabled)
-{
-	const QByteArray uuid = source_uuid.toUtf8();
-	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
-	if (!source)
-		return;
-	const char *id = obs_source_get_unversioned_id(source);
-	if (id && std::strcmp(id, kSourceId) == 0) {
-		obs_data_t *settings = obs_data_create();
-		obs_data_set_bool(settings, key, enabled);
-		obs_source_update(source, settings);
-		obs_data_release(settings);
-	}
-	obs_source_release(source);
-}
-
-void add_playback_context_actions(QWidget *dock, QWidget *header, QComboBox *selector, QAction **shuffle,
+template<typename SourceRef>
+void add_playback_context_actions(QWidget *dock, QWidget *header, SourceRef source_ref, QAction **shuffle,
 				  QAction **loop)
 {
-	const auto add = [dock, header, selector](const QString &text, const char *key, const char *name) {
+	const auto add = [dock, header, source_ref](const QString &text, const char *key, const char *name) {
 		auto *action = new QAction(text, dock);
 		action->setObjectName(QString::fromUtf8(name));
 		action->setCheckable(true);
 		action->setEnabled(false);
 		dock->addAction(action);
 		header->addAction(action);
-		QObject::connect(action, &QAction::triggered, dock, [selector, key](bool enabled) {
-			set_playback_option(selector->currentData().toString(), key, enabled);
+		QObject::connect(action, &QAction::triggered, dock, [source_ref, key](bool enabled) {
+			auto source = source_ref();
+			if (!source)
+				return;
+			OBSDataAutoRelease settings = obs_data_create();
+			obs_data_set_bool(settings, key, enabled);
+			obs_source_update(source, settings);
 		});
 		return action;
 	};
@@ -363,7 +217,7 @@ QLabel *make_section_icon(QStyle::StandardPixmap icon, QWidget *parent = nullptr
 	return label;
 }
 
-void update_program_source_indicators(QComboBox *selector, const QSet<QString> &active_sources)
+void update_program_source_indicators(QComboBox *selector, const QHash<QString, QString> &active_sources)
 {
 	const QIcon active_icon = palette_icon(selector, QStyle::SP_MediaPlay, QPalette::Text);
 	for (int index = 0; index < selector->count(); index++) {
@@ -377,6 +231,37 @@ void update_program_source_indicators(QComboBox *selector, const QSet<QString> &
 		selector->setItemData(index, active ? QObject::tr("Active in Program scene") : QString(),
 				      Qt::ToolTipRole);
 	}
+}
+
+QString populate_source_selector(QComboBox *selector, QLabel *status, const PlaylistProgramTracker &program,
+				 bool follow, QString &manual_uuid)
+{
+	const QSignalBlocker blocker(selector);
+	const auto &active = program.program_sources();
+	const QString program_uuid = active.size() == 1 ? active.cbegin().key() : QString();
+	selector->clear();
+	for (const auto &[uuid, name] : program.public_sources())
+		selector->addItem(name, uuid);
+
+	int manual_index = selector->findData(manual_uuid);
+	if (manual_index < 0 && manual_uuid.isEmpty() && selector->count() > 0)
+		manual_index = 0;
+	manual_uuid = manual_index >= 0 ? selector->itemData(manual_index).toString() : QString();
+
+	int selected_index = manual_index;
+	if (follow && !program_uuid.isEmpty()) {
+		selected_index = selector->findData(program_uuid);
+		if (selected_index < 0) {
+			/* Private Program copies have UUIDs but are absent from obs_enum_sources. */
+			selected_index = selector->count();
+			selector->addItem(active.value(program_uuid), program_uuid);
+		}
+	}
+	selector->setCurrentIndex(selected_index);
+	update_program_source_indicators(selector, active);
+	status->setText(follow_status_text(static_cast<std::size_t>(active.size())));
+	status->setVisible(follow);
+	return follow ? program_uuid : manual_uuid;
 }
 
 QFrame *make_separator(QWidget *parent = nullptr)
@@ -425,7 +310,172 @@ PlaylistControlDock *control_dock_instance;
 
 } // namespace
 
-PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
+PlaylistProgramTracker::PlaylistProgramTracker()
+{
+	auto *handler = obs_get_signal_handler();
+	for (const char *event : source_events)
+		signal_handler_connect(handler, event, source_event, this);
+	signal_handler_connect(handler, "channel_change", channel_event, this);
+	obs_frontend_add_event_callback(frontend_event, this);
+	refresh();
+}
+
+PlaylistProgramTracker::~PlaylistProgramTracker()
+{
+	obs_frontend_remove_event_callback(frontend_event, this);
+	auto *handler = obs_get_signal_handler();
+	for (const char *event : source_events)
+		signal_handler_disconnect(handler, event, source_event, this);
+	signal_handler_disconnect(handler, "channel_change", channel_event, this);
+	update_transition_connection(nullptr);
+	update_scene_connections({});
+}
+
+void PlaylistProgramTracker::source_event(void *data, calldata_t *calldata)
+{
+	if (mps_is_playlist_source(static_cast<obs_source_t *>(calldata_ptr(calldata, "source"))))
+		static_cast<PlaylistProgramTracker *>(data)->schedule_refresh();
+}
+
+void PlaylistProgramTracker::channel_event(void *data, calldata_t *calldata)
+{
+	if (calldata_int(calldata, "channel") == 0)
+		static_cast<PlaylistProgramTracker *>(data)->schedule_refresh();
+}
+
+void PlaylistProgramTracker::graph_event(void *data, calldata_t *)
+{
+	static_cast<PlaylistProgramTracker *>(data)->schedule_refresh();
+}
+
+void PlaylistProgramTracker::frontend_event(enum obs_frontend_event event, void *data)
+{
+	auto *tracker = static_cast<PlaylistProgramTracker *>(data);
+	switch (event) {
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP:
+	case OBS_FRONTEND_EVENT_EXIT:
+		tracker->collection_changing_ = true;
+		break;
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
+	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
+		tracker->collection_changing_ = false;
+		break;
+	case OBS_FRONTEND_EVENT_SCENE_CHANGED:
+	case OBS_FRONTEND_EVENT_TRANSITION_CHANGED:
+	case OBS_FRONTEND_EVENT_TRANSITION_STOPPED:
+	case OBS_FRONTEND_EVENT_STUDIO_MODE_ENABLED:
+	case OBS_FRONTEND_EVENT_STUDIO_MODE_DISABLED:
+		break;
+	default:
+		return;
+	}
+	tracker->schedule_refresh();
+}
+
+void PlaylistProgramTracker::schedule_refresh()
+{
+	if (refresh_queued_.exchange(true))
+		return;
+	QMetaObject::invokeMethod(
+		this,
+		[this] {
+			refresh_queued_.store(false);
+			refresh();
+		},
+		Qt::QueuedConnection);
+}
+
+void PlaylistProgramTracker::update_scene_connections(const QSet<signal_handler_t *> &handlers)
+{
+	for (auto *handler : scene_handlers_ - handlers)
+		for (const char *event : scene_events)
+			signal_handler_disconnect(handler, event, graph_event, this);
+	for (auto *handler : handlers - scene_handlers_)
+		for (const char *event : scene_events)
+			signal_handler_connect_ref(handler, event, graph_event, this);
+	scene_handlers_ = handlers;
+}
+
+void PlaylistProgramTracker::update_transition_connection(signal_handler_t *handler)
+{
+	if (handler == transition_handler_)
+		return;
+	if (transition_handler_)
+		for (const char *event : transition_events)
+			signal_handler_disconnect(transition_handler_, event, graph_event, this);
+	if (handler)
+		for (const char *event : transition_events)
+			signal_handler_connect_ref(handler, event, graph_event, this);
+	transition_handler_ = handler;
+}
+
+void PlaylistProgramTracker::refresh()
+{
+	decltype(public_sources_) public_sources;
+	decltype(program_sources_) program_sources;
+	QSet<signal_handler_t *> scene_handlers;
+	signal_handler_t *transition_handler = nullptr;
+
+	/* Hold the traversed sources only while reading and connecting to their
+	 * graph. connect_ref owns the signal handlers without extending source life. */
+	OBSSourceAutoRelease output;
+	MpsProgramSources graph;
+	if (!collection_changing_) {
+		obs_enum_sources(
+			[](void *data, obs_source_t *source) {
+				if (mps_is_playlist_source(source) && !obs_source_removed(source)) {
+					const char *uuid = obs_source_get_uuid(source);
+					if (uuid && *uuid)
+						static_cast<decltype(public_sources) *>(data)->append(
+							{QString::fromUtf8(uuid),
+							 QString::fromUtf8(obs_source_get_name(source))});
+				}
+				return true;
+			},
+			&public_sources);
+
+		/* Channel 0 includes the live transition and any temporary override.
+		 * The frontend scene API exposes the editable original in Studio Mode. */
+		output = obs_get_output_source(0);
+		if (output && obs_source_get_type(output) == OBS_SOURCE_TYPE_TRANSITION)
+			transition_handler = obs_source_get_signal_handler(output);
+		update_transition_connection(transition_handler);
+		graph = mps_program_sources(output);
+		for (const auto &scene : graph.scenes)
+			scene_handlers.insert(obs_source_get_signal_handler(scene));
+		for (const auto &source : graph.playlists) {
+			const char *uuid = obs_source_get_uuid(source);
+			if (uuid && *uuid)
+				program_sources.insert(QString::fromUtf8(uuid),
+						       QString::fromUtf8(obs_source_get_name(source)));
+		}
+	} else {
+		update_transition_connection(nullptr);
+	}
+	update_scene_connections(scene_handlers);
+
+	if (public_sources == public_sources_ && program_sources == program_sources_)
+		return;
+	public_sources_ = std::move(public_sources);
+	program_sources_ = std::move(program_sources);
+	emit sources_changed();
+}
+
+bool PlaylistProgramTracker::is_current_program_source(const QString &uuid) const
+{
+	if (uuid.isEmpty() || collection_changing_)
+		return false;
+	/* A click can arrive before the queued graph refresh. Recheck at dispatch
+	 * so a previous Program target cannot receive a follow-mode command. */
+	OBSSourceAutoRelease output = obs_get_output_source(0);
+	const auto graph = mps_program_sources(output);
+	return graph.playlists.size() == 1 && uuid == QString::fromUtf8(obs_source_get_uuid(graph.playlists.front()));
+}
+
+PlaylistQueueDock::PlaylistQueueDock(std::shared_ptr<PlaylistProgramTracker> program, QWidget *parent)
+	: QWidget(parent),
+	  program_(std::move(program))
 {
 	setWindowTitle(tr("Playlist Queue"));
 
@@ -504,28 +554,30 @@ PlaylistQueueDock::PlaylistQueueDock(QWidget *parent) : QWidget(parent)
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
 	configure_follow_context_menu(this, source_header, follow_program_action_);
-	add_playback_context_actions(this, source_header, source_selector_, &shuffle_action_, &loop_action_);
+	add_playback_context_actions(
+		this, source_header,
+		[this] { return command_source(*program_, follow_program_, selected_source_uuid_); }, &shuffle_action_,
+		&loop_action_);
 	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
 		follow_program_ = enabled;
-		follow_status_->setVisible(enabled);
-		if (enabled) {
-			if (refresh_program_state())
-				refresh_snapshot();
-		}
+		refresh_sources();
 	});
 
 	progress_timer_ = new QTimer(this);
 	progress_timer_->setInterval(kTimerIntervalMs);
 	connect(progress_timer_, &QTimer::timeout, this, &PlaylistQueueDock::refresh_progress);
-	connect(source_selector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+	connect(source_selector_, qOverload<int>(&QComboBox::activated), this, [this](int index) {
+		const QString uuid = source_selector_->itemData(index).toString();
+		if (follow_program_ && uuid == selected_source_uuid_)
+			return;
+		manual_source_uuid_ = uuid;
 		if (follow_program_)
 			follow_program_action_->setChecked(false);
-		selected_source_uuid_ = index >= 0 ? source_selector_->itemData(index).toString() : QString();
-		refresh_snapshot();
+		else
+			refresh_sources();
 	});
 
-	connect_obs_events(source_event, this);
-	obs_frontend_add_event_callback(frontend_event, this);
+	connect(program_.get(), &PlaylistProgramTracker::sources_changed, this, &PlaylistQueueDock::refresh_sources);
 	mps_playlist_change_add_listener(playback_changed, this);
 	refresh_sources();
 }
@@ -534,49 +586,12 @@ PlaylistQueueDock::~PlaylistQueueDock()
 {
 	if (progress_timer_)
 		progress_timer_->stop();
-	set_program_scene_event_connections(program_scene_uuids_, {}, program_scene_event, this);
 	mps_playlist_change_remove_listener(playback_changed, this);
-	obs_frontend_remove_event_callback(frontend_event, this);
-	disconnect_obs_events(source_event, this);
 }
 
 void PlaylistQueueDock::playback_changed(void *data, const char *source_uuid)
 {
 	static_cast<PlaylistQueueDock *>(data)->schedule_playback_refresh(source_uuid);
-}
-
-void PlaylistQueueDock::source_event(void *data, calldata_t *calldata)
-{
-	(void)calldata;
-	static_cast<PlaylistQueueDock *>(data)->schedule_refresh();
-}
-
-void PlaylistQueueDock::program_scene_event(void *data, calldata_t *calldata)
-{
-	(void)calldata;
-	static_cast<PlaylistQueueDock *>(data)->schedule_program_refresh();
-}
-
-void PlaylistQueueDock::frontend_event(enum obs_frontend_event event, void *data)
-{
-	auto *dock = static_cast<PlaylistQueueDock *>(data);
-	if (needs_source_refresh(event))
-		dock->schedule_refresh();
-	else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED)
-		dock->schedule_program_refresh();
-}
-
-void PlaylistQueueDock::schedule_refresh()
-{
-	if (refresh_queued_.exchange(true))
-		return;
-	QMetaObject::invokeMethod(
-		this,
-		[this] {
-			refresh_queued_.store(false);
-			refresh_sources();
-		},
-		Qt::QueuedConnection);
 }
 
 void PlaylistQueueDock::schedule_playback_refresh(const char *source_uuid)
@@ -611,70 +626,13 @@ void PlaylistQueueDock::schedule_playback_refresh(const char *source_uuid)
 		Qt::QueuedConnection);
 }
 
-void PlaylistQueueDock::schedule_program_refresh()
-{
-	if (program_refresh_queued_.exchange(true))
-		return;
-	QMetaObject::invokeMethod(
-		this,
-		[this] {
-			program_refresh_queued_.store(false);
-			if (refresh_program_state())
-				refresh_snapshot();
-		},
-		Qt::QueuedConnection);
-}
-
-bool PlaylistQueueDock::refresh_program_state()
-{
-	const ProgramSourceTraversal program = enumerate_program_sources();
-	set_program_scene_event_connections(program_scene_uuids_, program.scene_uuids, program_scene_event, this);
-	update_program_source_indicators(source_selector_, program.source_uuids);
-	if (!follow_program_)
-		return false;
-	const QSet<QString> &active_sources = program.source_uuids;
-	follow_status_->setText(follow_status_text(static_cast<std::size_t>(active_sources.size())));
-	const bool was_available = program_target_available_;
-	program_target_available_ = active_sources.size() == 1;
-	if (!program_target_available_)
-		return was_available;
-
-	const QString source_uuid = *active_sources.cbegin();
-	if (source_uuid == selected_source_uuid_)
-		return !was_available;
-	const int index = source_selector_->findData(source_uuid);
-	if (index < 0) {
-		program_target_available_ = false;
-		return was_available;
-	}
-	const QSignalBlocker blocker(source_selector_);
-	source_selector_->setCurrentIndex(index);
-	selected_source_uuid_ = source_uuid;
-	return true;
-}
-
 void PlaylistQueueDock::refresh_sources()
 {
-	const QVector<SourceInfo> sources = enumerate_mps_sources();
-	const QString previous_selection = selected_source_uuid_;
-	int selected_index = -1;
-	{
-		const QSignalBlocker blocker(source_selector_);
-		source_selector_->clear();
-		for (const SourceInfo &source : sources) {
-			source_selector_->addItem(source.name, source.uuid);
-			if (source.uuid == previous_selection)
-				selected_index = source_selector_->count() - 1;
-		}
-		if (selected_index < 0 && previous_selection.isEmpty() && source_selector_->count() > 0)
-			selected_index = 0;
-		source_selector_->setCurrentIndex(selected_index);
-		if (selected_index >= 0)
-			selected_source_uuid_ = source_selector_->itemData(selected_index).toString();
-		else
-			selected_source_uuid_.clear();
-	}
-	refresh_program_state();
+	const QString target = populate_source_selector(source_selector_, follow_status_, *program_, follow_program_,
+							manual_source_uuid_);
+	if (selected_source_uuid_ != target)
+		duration_cache_.clear();
+	selected_source_uuid_ = target;
 	refresh_snapshot();
 }
 
@@ -683,95 +641,30 @@ void PlaylistQueueDock::clear_snapshot()
 	update_playback_context_actions(shuffle_action_, loop_action_, false, false, false);
 	playlist_remaining_row_->setVisible(true);
 	previous_value_->setFilePath(nullptr);
-	current_value_->setFilePath(nullptr);
 	next_value_->setFilePath(nullptr);
 	previous_duration_value_->setText(QStringLiteral("--:--"));
-	current_duration_value_->setText(QStringLiteral("--:--"));
 	next_duration_value_->clear();
-	current_path_.clear();
-	has_current_ = false;
-	update_progress(-1, -1, -1, -1);
+	context_available_ = false;
+	update_timing(nullptr);
 }
 
 void PlaylistQueueDock::cache_duration(const char *path, int64_t duration_ms)
 {
 	if (!path || !*path || duration_ms <= 0 || selected_source_uuid_.isEmpty())
 		return;
-	duration_cache_.insert(selected_source_uuid_ + QLatin1Char('\n') + QString::fromUtf8(path), duration_ms);
+	duration_cache_.insert(QString::fromUtf8(path), duration_ms);
 }
 
 int64_t PlaylistQueueDock::cached_duration(const char *path) const
 {
 	if (!path || !*path || selected_source_uuid_.isEmpty())
 		return -1;
-	return duration_cache_.value(selected_source_uuid_ + QLatin1Char('\n') + QString::fromUtf8(path), -1);
+	return duration_cache_.value(QString::fromUtf8(path), -1);
 }
 
 void PlaylistQueueDock::refresh_snapshot()
 {
-	if (selected_source_uuid_.isEmpty() || (follow_program_ && !program_target_available_)) {
-		clear_snapshot();
-		return;
-	}
-
-	const QByteArray uuid = selected_source_uuid_.toUtf8();
-	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
-	if (!source) {
-		clear_snapshot();
-		return;
-	}
-
-	struct mps_playlist_context_snapshot snapshot = {0};
-	const bool found = mps_playlist_context_snapshot_get(source, &snapshot);
-	struct mps_playlist_telemetry telemetry;
-	mps_playlist_telemetry_init(&telemetry);
-	int64_t standby_duration_ms = 0;
-	const bool timing_found = found && mps_playlist_telemetry_get(source, &telemetry);
-	const bool standby_duration_found =
-		found && snapshot.next &&
-		mps_playlist_standby_duration_get(source, snapshot.next, &standby_duration_ms);
-	obs_data_t *settings = obs_source_get_settings(source);
-	const bool looping = timing_found ? telemetry.loop : obs_data_get_bool(settings, "loop");
-	obs_data_release(settings);
-	obs_source_release(source);
-	if (!found) {
-		mps_playlist_context_snapshot_free(&snapshot);
-		mps_playlist_telemetry_free(&telemetry);
-		clear_snapshot();
-		return;
-	}
-
-	update_playback_context_actions(shuffle_action_, loop_action_, true, snapshot.shuffle, looping);
-	playlist_remaining_row_->setVisible(!looping);
-	previous_value_->setFilePath(snapshot.previous);
-	current_value_->setFilePath(timing_found ? telemetry.current_path : nullptr);
-	next_value_->setFilePath(snapshot.next);
-	if (timing_found)
-		cache_duration(telemetry.current_path, telemetry.duration_media_ms);
-	if (standby_duration_found)
-		cache_duration(snapshot.next, standby_duration_ms);
-	previous_duration_value_->setText(format_media_duration(cached_duration(snapshot.previous)));
-	const int64_t next_duration = cached_duration(snapshot.next);
-	next_duration_value_->setText(next_duration > 0 ? format_media_duration(next_duration) : QString());
-	current_path_ = QString::fromUtf8(telemetry.current_path ? telemetry.current_path : "");
-	has_current_ = telemetry.current_path != nullptr;
-	update_progress(telemetry.elapsed_media_ms, telemetry.duration_media_ms, telemetry.remaining_ms,
-			telemetry.playlist_remaining_known ? telemetry.playlist_remaining_ms : -1);
-	mps_playlist_telemetry_free(&telemetry);
-	mps_playlist_context_snapshot_free(&snapshot);
-}
-
-void PlaylistQueueDock::refresh_progress()
-{
-	if (!isVisible())
-		return;
-	if (selected_source_uuid_.isEmpty() || (follow_program_ && !program_target_available_)) {
-		clear_snapshot();
-		return;
-	}
-
-	const QByteArray uuid = selected_source_uuid_.toUtf8();
-	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
+	auto source = dock_source(selected_source_uuid_);
 	if (!source) {
 		clear_snapshot();
 		return;
@@ -779,20 +672,71 @@ void PlaylistQueueDock::refresh_progress()
 
 	struct mps_playlist_telemetry telemetry;
 	const bool found = mps_playlist_telemetry_get(source, &telemetry);
-	obs_source_release(source);
-	if (found) {
+	refresh_context(source, found ? &telemetry : nullptr);
+	mps_playlist_telemetry_free(&telemetry);
+}
+
+void PlaylistQueueDock::refresh_context(obs_source_t *source, const struct mps_playlist_telemetry *telemetry)
+{
+	struct mps_playlist_context_snapshot snapshot {};
+	context_available_ = mps_playlist_context_snapshot_get(source, &snapshot);
+	if (!context_available_) {
+		clear_snapshot();
+		return;
+	}
+
+	OBSDataAutoRelease settings = obs_source_get_settings(source);
+	const bool looping = telemetry ? telemetry->loop : obs_data_get_bool(settings, "loop");
+	update_playback_context_actions(shuffle_action_, loop_action_, true, snapshot.shuffle, looping);
+	playlist_remaining_row_->setVisible(!looping);
+	previous_value_->setFilePath(snapshot.previous);
+	next_value_->setFilePath(snapshot.next);
+	int64_t standby_duration_ms = 0;
+	if (snapshot.next && mps_playlist_standby_duration_get(source, snapshot.next, &standby_duration_ms))
+		cache_duration(snapshot.next, standby_duration_ms);
+	previous_duration_value_->setText(format_media_duration(cached_duration(snapshot.previous)));
+	const int64_t next_duration = cached_duration(snapshot.next);
+	next_duration_value_->setText(next_duration > 0 ? format_media_duration(next_duration) : QString());
+	update_timing(telemetry);
+	mps_playlist_context_snapshot_free(&snapshot);
+}
+
+void PlaylistQueueDock::refresh_progress()
+{
+	if (!isVisible())
+		return;
+	auto source = dock_source(selected_source_uuid_);
+	if (!source) {
+		clear_snapshot();
+		return;
+	}
+
+	struct mps_playlist_telemetry telemetry;
+	const bool found = mps_playlist_telemetry_get(source, &telemetry);
+	if (!found || !context_available_) {
+		/* A racing A/B cut can invalidate the clock without invalidating the
+		 * playlist context. Re-read the context and hide unverified timing. */
+		refresh_context(source, found ? &telemetry : nullptr);
+	} else {
 		update_playback_context_actions(shuffle_action_, loop_action_, true, telemetry.shuffle, telemetry.loop);
 		playlist_remaining_row_->setVisible(!telemetry.loop);
-		current_value_->setFilePath(telemetry.current_path);
-		current_path_ = QString::fromUtf8(telemetry.current_path ? telemetry.current_path : "");
-		has_current_ = telemetry.current_path != nullptr;
-		cache_duration(telemetry.current_path, telemetry.duration_media_ms);
-		update_progress(telemetry.elapsed_media_ms, telemetry.duration_media_ms, telemetry.remaining_ms,
-				telemetry.playlist_remaining_known ? telemetry.playlist_remaining_ms : -1);
-	} else {
-		clear_snapshot();
+		update_timing(&telemetry);
 	}
 	mps_playlist_telemetry_free(&telemetry);
+}
+
+void PlaylistQueueDock::update_timing(const struct mps_playlist_telemetry *telemetry)
+{
+	has_current_ = telemetry && telemetry->current_path && telemetry->state != OBS_MEDIA_STATE_NONE &&
+		       telemetry->state != OBS_MEDIA_STATE_STOPPED && telemetry->state != OBS_MEDIA_STATE_ENDED;
+	current_value_->setFilePath(has_current_ ? telemetry->current_path : nullptr);
+	if (!has_current_) {
+		update_progress(-1, -1, -1, -1);
+		return;
+	}
+	cache_duration(telemetry->current_path, telemetry->duration_media_ms);
+	update_progress(telemetry->elapsed_media_ms, telemetry->duration_media_ms, telemetry->remaining_ms,
+			telemetry->playlist_remaining_known ? telemetry->playlist_remaining_ms : -1);
 }
 
 void PlaylistQueueDock::update_progress(int64_t time_ms, int64_t duration_ms, int64_t remaining_ms,
@@ -829,7 +773,9 @@ void PlaylistQueueDock::hideEvent(QHideEvent *event)
 	QWidget::hideEvent(event);
 }
 
-PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
+PlaylistControlDock::PlaylistControlDock(std::shared_ptr<PlaylistProgramTracker> program, QWidget *parent)
+	: QWidget(parent),
+	  program_(std::move(program))
 {
 	setWindowTitle(tr("Playlist Control"));
 
@@ -918,7 +864,10 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	follow_program_action_ = new QAction(tr("Follow Program MPS"), this);
 	follow_program_action_->setCheckable(true);
 	configure_follow_context_menu(this, source_header, follow_program_action_);
-	add_playback_context_actions(this, source_header, source_selector_, &shuffle_action_, &loop_action_);
+	add_playback_context_actions(
+		this, source_header,
+		[this] { return command_source(*program_, follow_program_, selected_source_uuid_); }, &shuffle_action_,
+		&loop_action_);
 	auto *show_controls = new QAction(tr("Show playback toolbar"), this);
 	show_controls->setObjectName(QStringLiteral("mpsShowPlaybackControls"));
 	show_controls->setCheckable(true);
@@ -934,22 +883,18 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	playlist_->addAction(loop_action_);
 	connect(follow_program_action_, &QAction::toggled, this, [this](bool enabled) {
 		follow_program_ = enabled;
-		follow_status_->setVisible(enabled);
-		if (enabled) {
-			if (refresh_program_state())
-				refresh_playlist();
-		} else {
-			refresh_program_state();
-		}
+		refresh_sources();
 	});
 
-	connect(source_selector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+	connect(source_selector_, qOverload<int>(&QComboBox::activated), this, [this](int index) {
+		const QString uuid = source_selector_->itemData(index).toString();
+		if (follow_program_ && uuid == selected_source_uuid_)
+			return;
+		manual_source_uuid_ = uuid;
 		if (follow_program_)
 			follow_program_action_->setChecked(false);
-		selected_source_uuid_ = index >= 0 ? source_selector_->itemData(index).toString() : QString();
-		selection_valid_ = false;
-		selected_stable_id_.clear();
-		refresh_playlist();
+		else
+			refresh_sources();
 	});
 	connect(playlist_, &QTreeWidget::itemSelectionChanged, this, [this] {
 		QTreeWidgetItem *item = playlist_->currentItem();
@@ -964,57 +909,19 @@ PlaylistControlDock::PlaylistControlDock(QWidget *parent) : QWidget(parent)
 	connect(play_button_, &QPushButton::clicked, this, &PlaylistControlDock::play_selected);
 	connect(playlist_, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem *, int) { play_selected(); });
 
-	connect_obs_events(source_event, this);
-	obs_frontend_add_event_callback(frontend_event, this);
+	connect(program_.get(), &PlaylistProgramTracker::sources_changed, this, &PlaylistControlDock::refresh_sources);
 	mps_playlist_change_add_listener(playback_changed, this);
 	refresh_sources();
 }
 
 PlaylistControlDock::~PlaylistControlDock()
 {
-	set_program_scene_event_connections(program_scene_uuids_, {}, program_scene_event, this);
 	mps_playlist_change_remove_listener(playback_changed, this);
-	obs_frontend_remove_event_callback(frontend_event, this);
-	disconnect_obs_events(source_event, this);
 }
 
 void PlaylistControlDock::playback_changed(void *data, const char *source_uuid)
 {
 	static_cast<PlaylistControlDock *>(data)->schedule_playback_refresh(source_uuid);
-}
-
-void PlaylistControlDock::source_event(void *data, calldata_t *calldata)
-{
-	(void)calldata;
-	static_cast<PlaylistControlDock *>(data)->schedule_refresh();
-}
-
-void PlaylistControlDock::program_scene_event(void *data, calldata_t *calldata)
-{
-	(void)calldata;
-	static_cast<PlaylistControlDock *>(data)->schedule_program_refresh();
-}
-
-void PlaylistControlDock::frontend_event(enum obs_frontend_event event, void *data)
-{
-	auto *dock = static_cast<PlaylistControlDock *>(data);
-	if (needs_source_refresh(event))
-		dock->schedule_refresh();
-	else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED)
-		dock->schedule_program_refresh();
-}
-
-void PlaylistControlDock::schedule_refresh()
-{
-	if (refresh_queued_.exchange(true))
-		return;
-	QMetaObject::invokeMethod(
-		this,
-		[this] {
-			refresh_queued_.store(false);
-			refresh_sources();
-		},
-		Qt::QueuedConnection);
 }
 
 void PlaylistControlDock::schedule_playback_refresh(const char *source_uuid)
@@ -1049,68 +956,15 @@ void PlaylistControlDock::schedule_playback_refresh(const char *source_uuid)
 		Qt::QueuedConnection);
 }
 
-void PlaylistControlDock::schedule_program_refresh()
-{
-	if (program_refresh_queued_.exchange(true))
-		return;
-	QMetaObject::invokeMethod(
-		this,
-		[this] {
-			program_refresh_queued_.store(false);
-			if (refresh_program_state())
-				refresh_playlist();
-		},
-		Qt::QueuedConnection);
-}
-
-bool PlaylistControlDock::refresh_program_state()
-{
-	const ProgramSourceTraversal program = enumerate_program_sources();
-	set_program_scene_event_connections(program_scene_uuids_, program.scene_uuids, program_scene_event, this);
-	update_program_source_indicators(source_selector_, program.source_uuids);
-	if (!follow_program_)
-		return false;
-	const QSet<QString> &active_sources = program.source_uuids;
-	follow_status_->setText(follow_status_text(static_cast<std::size_t>(active_sources.size())));
-	if (active_sources.size() != 1)
-		return false;
-
-	const QString source_uuid = *active_sources.cbegin();
-	if (source_uuid == selected_source_uuid_)
-		return false;
-	const int index = source_selector_->findData(source_uuid);
-	if (index < 0)
-		return false;
-	const QSignalBlocker blocker(source_selector_);
-	source_selector_->setCurrentIndex(index);
-	selected_source_uuid_ = source_uuid;
-	selection_valid_ = false;
-	selected_stable_id_.clear();
-	return true;
-}
-
 void PlaylistControlDock::refresh_sources()
 {
-	const QVector<SourceInfo> sources = enumerate_mps_sources();
-	const QString previous_selection = selected_source_uuid_;
-	int selected_index = -1;
-	{
-		const QSignalBlocker blocker(source_selector_);
-		source_selector_->clear();
-		for (const SourceInfo &source : sources) {
-			source_selector_->addItem(source.name, source.uuid);
-			if (source.uuid == previous_selection)
-				selected_index = source_selector_->count() - 1;
-		}
-		if (selected_index < 0 && previous_selection.isEmpty() && source_selector_->count() > 0)
-			selected_index = 0;
-		source_selector_->setCurrentIndex(selected_index);
-		if (selected_index >= 0)
-			selected_source_uuid_ = source_selector_->itemData(selected_index).toString();
-		else
-			selected_source_uuid_.clear();
+	const QString target = populate_source_selector(source_selector_, follow_status_, *program_, follow_program_,
+							manual_source_uuid_);
+	if (selected_source_uuid_ != target) {
+		selection_valid_ = false;
+		selected_stable_id_.clear();
 	}
-	refresh_program_state();
+	selected_source_uuid_ = target;
 	refresh_playlist();
 }
 
@@ -1129,28 +983,16 @@ void PlaylistControlDock::refresh_playlist()
 	selected_stable_id_.clear();
 	shuffle_info_->setVisible(false);
 	update_playback_context_actions(shuffle_action_, loop_action_, false, false, false);
-	if (selected_source_uuid_.isEmpty()) {
-		update_play_button();
-		return;
-	}
-
-	const QByteArray uuid = selected_source_uuid_.toUtf8();
-	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
-	if (!source) {
-		update_play_button();
-		return;
-	}
-
-	struct mps_playlist_entries_snapshot snapshot = {0};
-	const bool found = mps_playlist_entries_snapshot_get(source, &snapshot);
-	const bool playing = obs_source_media_get_state(source) == OBS_MEDIA_STATE_PLAYING;
+	auto source = dock_source(selected_source_uuid_);
+	struct mps_playlist_entries_snapshot snapshot {};
+	playlist_available_ = source && mps_playlist_entries_snapshot_get(source, &snapshot);
+	const bool playing = playlist_available_ && obs_source_media_get_state(source) == OBS_MEDIA_STATE_PLAYING;
 	pause_button_->setText(playing ? tr("Pause") : tr("Play"));
 	pause_button_->setIcon(
 		palette_icon(this, playing ? QStyle::SP_MediaPause : QStyle::SP_MediaPlay, QPalette::ButtonText));
 	pause_button_->setAccessibleName(pause_button_->text());
 	pause_button_->setToolTip(pause_button_->text());
-	obs_source_release(source);
-	if (!found) {
+	if (!playlist_available_) {
 		mps_playlist_entries_snapshot_free(&snapshot);
 		update_play_button();
 		return;
@@ -1224,10 +1066,8 @@ void PlaylistControlDock::refresh_playlist()
 
 void PlaylistControlDock::update_play_button()
 {
-	const bool has_source = !selected_source_uuid_.isEmpty();
-	playback_controls_->setEnabled(has_source);
-
-	play_button_->setEnabled(selection_valid_ && has_source);
+	playback_controls_->setEnabled(playlist_available_);
+	play_button_->setEnabled(selection_valid_ && playlist_available_);
 	QTreeWidgetItem *item = selection_valid_ ? playlist_->currentItem() : nullptr;
 	const QByteArray selected_path = item ? item->data(0, kPathRole).toString().toUtf8() : QByteArray();
 	selected_value_->setFilePath(selected_path.isEmpty() ? nullptr : selected_path.constData());
@@ -1235,63 +1075,63 @@ void PlaylistControlDock::update_play_button()
 
 void PlaylistControlDock::play_selected()
 {
-	if (!selection_valid_ || selected_source_uuid_.isEmpty() || selected_stable_id_.isEmpty())
+	if (!selection_valid_ || selected_stable_id_.isEmpty())
 		return;
-	const QByteArray uuid = selected_source_uuid_.toUtf8();
-	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
+	auto source = command_source(*program_, follow_program_, selected_source_uuid_);
 	struct obs_video_info video_info;
-	if (!source)
+	if (!source || !obs_get_video_info(&video_info))
 		return;
-	if (!obs_get_video_info(&video_info)) {
-		obs_source_release(source);
-		return;
-	}
+
 	struct Selection {
-		obs_source_t *source;
+		OBSWeakSource source;
 		QByteArray id;
 		std::uint64_t revision;
+		bool follow;
 	};
-	auto *selection = new Selection{source, selected_stable_id_.toUtf8(), playlist_revision_};
+	auto *selection =
+		new Selection{OBSGetWeakRef(source), selected_stable_id_.toUtf8(), playlist_revision_, follow_program_};
 	obs_queue_task(
 		OBS_TASK_GRAPHICS,
 		[](void *data) {
-			auto *selection = static_cast<Selection *>(data);
-			mps_playlist_select_item(selection->source, selection->id.constData(), selection->revision);
-			obs_source_release(selection->source);
-			delete selection;
+			const std::unique_ptr<Selection> selection(static_cast<Selection *>(data));
+			auto source = OBSGetStrongRef(selection->source);
+			if (!source || obs_source_removed(source))
+				return;
+			if (selection->follow) {
+				OBSSourceAutoRelease output = obs_get_output_source(0);
+				const auto graph = mps_program_sources(output);
+				if (graph.playlists.size() != 1 || graph.playlists.front() != source)
+					return;
+			}
+			mps_playlist_select_item(source, selection->id.constData(), selection->revision);
 		},
 		selection, false);
 }
 
 void PlaylistControlDock::control_playback(PlaybackAction action)
 {
-	const QByteArray uuid = selected_source_uuid_.toUtf8();
-	obs_source_t *source = obs_get_source_by_uuid(uuid.constData());
+	auto source = command_source(*program_, follow_program_, selected_source_uuid_);
 	if (!source)
 		return;
-	const char *id = obs_source_get_unversioned_id(source);
-	if (id && std::strcmp(id, kSourceId) == 0) {
-		switch (action) {
-		case PlaybackAction::Previous:
-			obs_source_media_previous(source);
-			break;
-		case PlaybackAction::Next:
-			obs_source_media_next(source);
-			break;
-		case PlaybackAction::Stop:
-			obs_source_media_stop(source);
-			break;
-		case PlaybackAction::PlayPause: {
-			auto state = obs_source_media_get_state(source);
-			if (state == OBS_MEDIA_STATE_STOPPED || state == OBS_MEDIA_STATE_ENDED)
-				obs_source_media_restart(source);
-			else
-				obs_source_media_play_pause(source, state == OBS_MEDIA_STATE_PLAYING);
-			break;
-		}
-		}
+	switch (action) {
+	case PlaybackAction::Previous:
+		obs_source_media_previous(source);
+		break;
+	case PlaybackAction::Next:
+		obs_source_media_next(source);
+		break;
+	case PlaybackAction::Stop:
+		obs_source_media_stop(source);
+		break;
+	case PlaybackAction::PlayPause: {
+		const auto state = obs_source_media_get_state(source);
+		if (state == OBS_MEDIA_STATE_STOPPED || state == OBS_MEDIA_STATE_ENDED)
+			obs_source_media_restart(source);
+		else
+			obs_source_media_play_pause(source, state == OBS_MEDIA_STATE_PLAYING);
+		break;
 	}
-	obs_source_release(source);
+	}
 }
 
 extern "C" void mps_playlist_dock_register(void)
@@ -1299,14 +1139,15 @@ extern "C" void mps_playlist_dock_register(void)
 	if (queue_dock_instance || control_dock_instance)
 		return;
 
-	auto *queue = new PlaylistQueueDock;
+	const auto program = std::make_shared<PlaylistProgramTracker>();
+	auto *queue = new PlaylistQueueDock(program);
 	if (!obs_frontend_add_dock_by_id(kQueueDockId, "Playlist Queue", queue)) {
 		delete queue;
 		return;
 	}
 	queue_dock_instance = queue;
 
-	auto *control = new PlaylistControlDock;
+	auto *control = new PlaylistControlDock(program);
 	if (!obs_frontend_add_dock_by_id(kControlDockId, "Playlist Control", control)) {
 		obs_frontend_remove_dock(kQueueDockId);
 		queue_dock_instance = nullptr;

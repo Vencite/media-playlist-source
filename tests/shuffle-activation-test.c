@@ -885,11 +885,54 @@ static void destroy_queue_barrier(void *unused)
 	UNUSED_PARAMETER(unused);
 }
 
+static void test_restart_and_resume_after_cancelled_bootstrap(void)
+{
+	obs_source_t *source = create_playlist(2, SHUFFLE_RESET_PRESERVE);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	mps->restart_behavior = RESTART_BEHAVIOR_CURRENT_FILE;
+	mps->visibility_behavior = VISIBILITY_BEHAVIOR_STOP_RESTART;
+	struct media_file_data *selected = mps->actual_media;
+	assert(selected && !mps->active_slot && mps->coordinator.request_pending);
+
+	mps_stop(mps);
+	assert(!mps->coordinator.request_pending);
+	mps_restart(mps);
+	assert(mps->coordinator.request_pending && mps->actual_media == selected);
+	uint64_t generation = mps->coordinator.generation;
+	mps_restart(mps);
+	assert(mps->coordinator.generation == generation);
+
+	mps_stop(mps);
+	mps_play_pause(mps, true);
+	assert(!mps->coordinator.request_pending);
+	mps_play_pause(mps, false);
+	assert(mps->coordinator.request_pending && mps->actual_media == selected);
+	obs_source_release(source);
+}
+
+static void test_rejected_active_child_is_not_committed(void)
+{
+	obs_source_t *source = create_playlist(2, SHUFFLE_RESET_PRESERVE);
+	struct media_playlist_source *mps = obs_obj_get_data(source);
+	struct media_source_slot *standby = mps->standby_slot;
+	/* libobs rejects a source as its own active child. A failed registration
+	 * must never publish the standby or record a reference to remove. */
+	standby->source = obs_source_get_ref(source);
+	standby->request_generation = mps->coordinator.generation;
+	assert(!activate_and_cut(mps, standby, standby->request_generation));
+	assert(standby->failed && !standby->child_added);
+	assert(!mps->active_slot && mps->coordinator.request_pending);
+	destroy_media_slot(standby);
+	obs_source_release(source);
+}
+
 int main(void)
 {
 	assert(obs_startup("en-US", NULL, NULL));
 	obs_register_source(&media_playlist_source_info);
 	obs_register_source(&folder_fake_decoder);
+	test_restart_and_resume_after_cancelled_bootstrap();
+	test_rejected_active_child_is_not_committed();
 	test_previous_after_removing_later_current_folder_item();
 	test_previous_after_removing_first_current_folder_item();
 	test_folder_recovery_preserves_current_in_later_folder();

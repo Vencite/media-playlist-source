@@ -68,13 +68,21 @@ target_sources(
 # cmake-format: on
 
 if(ENABLE_FRONTEND_API AND ENABLE_QT)
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/playlist-dock.hpp src/playlist-dock.cpp)
+  target_sources(
+    ${CMAKE_PROJECT_NAME}
+    PRIVATE src/playlist-dock.hpp src/playlist-dock.cpp src/program-sources.hpp src/program-sources.cpp
+  )
   target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE MPS_ENABLE_PLAYLIST_DOCK)
 endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
 if(BUILD_TESTING)
+  add_executable(program-sources-test tests/program-sources-test.cpp src/program-sources.cpp)
+  target_include_directories(program-sources-test PRIVATE src)
+  target_link_libraries(program-sources-test PRIVATE OBS::libobs)
+  add_test(NAME program-sources COMMAND program-sources-test)
+
   add_executable(folder-reconcile-test tests/folder-reconcile-test.c)
   target_include_directories(folder-reconcile-test PRIVATE src)
   target_link_libraries(folder-reconcile-test PRIVATE OBS::libobs)
